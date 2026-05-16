@@ -1,0 +1,15 @@
+hazelcast:
+  instance-name: cache-demo-instance
+  network:
+    join:
+      auto-detection:
+        enabled: false
+      multicast:
+        enabled: false
+      tcp-ip:
+        enabled: false
+    interfaces:
+      enabled: false
+  # Map configuration (TTL, max-size, LRU eviction) is applied programmatically
+  # in HazelcastConfig based on cache.hazelcast.* properties from application.yaml.
+  # Near-cache is intentionally absent to prevent stale reads.

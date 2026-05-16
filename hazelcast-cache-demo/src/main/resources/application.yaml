@@ -1,0 +1,22 @@
+cache:
+  hazelcast:
+    map-name: entity-cache
+    ttl-seconds: 300
+    max-size: 10000
+  storage:
+    backend: mongodb   # switch to: rocksdb | fluss | jdbc
+
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/cachedb
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,info
+  metrics:
+    export:
+      simple:
+        enabled: true
