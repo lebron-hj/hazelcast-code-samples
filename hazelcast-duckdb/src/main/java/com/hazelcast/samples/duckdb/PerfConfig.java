@@ -111,10 +111,11 @@ public final class PerfConfig {
     public static final long BATCH_WRITING_TIMEOUT_MS;
 
     /**
-     * 写入模式："insert"、"copy" 或 "arrow"
+     * 写入模式："insert"、"copy"、"arrow" 或 "appender"
      * insert模式：使用PreparedStatement批量插入（兼容模式）
      * copy模式：使用COPY命令批量写入（高性能）
      * arrow模式：使用Arrow VectorSchemaRoot零拷贝导入（极致性能）
+     * appender模式：使用DuckDB Appender API（高性能）
      */
     public static final String WRITE_MODE;
 
@@ -179,8 +180,8 @@ public final class PerfConfig {
             // - 禁用检查点
             // - 启用对象缓存
             int cpuCores = Runtime.getRuntime().availableProcessors();
-//            jdbcUrl = String.format("jdbc:duckdb:memory:?memory_limit=8GB&threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
-            jdbcUrl = String.format("jdbc:duckdb:memory:?threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
+            jdbcUrl = String.format("jdbc:duckdb:memory:?memory_limit=1GB&threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
+//            jdbcUrl = String.format("jdbc:duckdb:memory:?threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
         }
         DUCKDB_JDBC_URL = jdbcUrl;
 
@@ -208,9 +209,10 @@ public final class PerfConfig {
         BATCH_WRITING_ENABLED = Boolean.parseBoolean(System.getProperty("duckdb.batch-writing.enabled", "true"));
         BATCH_WRITING_SIZE = Integer.getInteger("duckdb.batch-writing.size", 100);
         BATCH_WRITING_TIMEOUT_MS = Long.getLong("duckdb.batch-writing.timeout-ms", 1000L);
-        // 写入模式：insert、copy 或 arrow
+        // 写入模式：insert、copy、arrow 或 appender
         String writeMode = System.getProperty("duckdb.write.mode", "insert");
-        if (!"copy".equalsIgnoreCase(writeMode) && !"insert".equalsIgnoreCase(writeMode) && !"arrow".equalsIgnoreCase(writeMode)) {
+        if (!"copy".equalsIgnoreCase(writeMode) && !"insert".equalsIgnoreCase(writeMode) && 
+            !"arrow".equalsIgnoreCase(writeMode) && !"appender".equalsIgnoreCase(writeMode)) {
             writeMode = "insert";
         }
         WRITE_MODE = writeMode.toLowerCase();

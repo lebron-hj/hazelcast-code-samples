@@ -219,10 +219,11 @@ public final class HazelcastDuckDbJob {
 
     /**
      * 根据配置创建DuckDB Operator
-     * 支持三种模式：
+     * 支持四种模式：
      * - insert模式：使用PreparedStatement批量插入（兼容模式）
      * - copy模式：使用COPY命令批量写入（高性能）
      * - arrow模式：使用Arrow VectorSchemaRoot零拷贝导入（极致性能）
+     * - appender模式：使用DuckDB Appender API（高性能）
      */
     private static DuckDbOperator createDuckDbOperator() {
         try {
@@ -232,6 +233,9 @@ public final class HazelcastDuckDbJob {
             } else if ("copy".equalsIgnoreCase(PerfConfig.WRITE_MODE)) {
                 System.out.println("[INFO] 使用 COPY 模式写入 DuckDB（高性能）");
                 return new CopyModeDuckDbOperator();
+            } else if ("appender".equalsIgnoreCase(PerfConfig.WRITE_MODE)) {
+                System.out.println("[INFO] 使用 APPENDER 模式写入 DuckDB（高性能）");
+                return new AppenderModeDuckDbOperator();
             } else {
                 System.out.println("[INFO] 使用 INSERT 模式写入 DuckDB（兼容模式）");
                 return new EcommerceDuckDbOperator();

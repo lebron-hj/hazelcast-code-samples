@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -88,10 +89,33 @@ class HazelcastDuckDbJobTest {
             int totalItems = batches.stream().mapToInt(batch -> batch.items().size()).sum();
             System.out.println("  总订单项数 " + totalItems + " 行数据");
             
-            List<java.util.Map<String, Object>> rows = HazelcastDuckDbJob.run(instance, batches);
+            List<Map<String, Object>> rows = HazelcastDuckDbJob.run(instance, batches);
             assertFalse(rows.isEmpty());
             
             System.out.println("\n✅ Standard 模式大型测试完成！");
+        } finally {
+            instance.shutdown();
+        }
+    }
+
+    @Test
+    void run_largeScaleTest_AppenderMode() {
+        System.setProperty("duckdb.write.mode", "appender");
+        
+        Config config = new Config();
+        config.getJetConfig().setEnabled(true);
+        HazelcastInstance instance = Hazelcast.newHazelcastInstance(config);
+        try {
+            // 测试较大数据集（100批次）
+            System.out.println("\n📊 Appender 模式测试大数据集（100批次）...");
+            List<EcommerceOrderBatch> batches = EcommerceMockGenerator.generateBatches(100);
+            int totalItems = batches.stream().mapToInt(batch -> batch.items().size()).sum();
+            System.out.println("  总订单项数 " + totalItems + " 行数据");
+            
+            List<Map<String, Object>> rows = HazelcastDuckDbJob.run(instance, batches);
+            assertFalse(rows.isEmpty());
+            
+            System.out.println("\n✅ Appender 模式大型测试完成！");
         } finally {
             instance.shutdown();
         }

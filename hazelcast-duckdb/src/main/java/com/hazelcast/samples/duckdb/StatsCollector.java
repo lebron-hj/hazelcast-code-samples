@@ -17,6 +17,7 @@ package com.hazelcast.samples.duckdb;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,9 +61,11 @@ public final class StatsCollector {
     
     private final int windowSeconds;
     private final long[] sampleTimestamps;
-    private final long[] sampleTotalRows;
-    private final Map<String, long[]> sampleTableRows = new ConcurrentHashMap<>();
-    private final long[] sampleJoinRows;
+    // 存储增量值（而非累计值）用于更精准计算
+    private final long[] deltaTotalRows;
+    private final Map<String, long[]> deltaTableRows = new ConcurrentHashMap<>();
+    private final long[] deltaJoinRows;
+    private final long[] deltaLatencyNanos;
     private int sampleIndex = 0;
     private final ScheduledExecutorService scheduler;
     private final boolean rollingEnabled;
@@ -71,6 +74,8 @@ public final class StatsCollector {
     // 上一次采样的值（用于计算增量）
     private volatile long lastTotalRows = 0;
     private volatile long lastJoinRows = 0;
+    private volatile long lastSumBatchNanos = 0;
+    private volatile long lastCountBatchNanos = 0;
     private final Map<String, AtomicLong> lastTableRows = new ConcurrentHashMap<>();
 
     private StatsCollector() {
@@ -95,12 +100,18 @@ public final class StatsCollector {
         windowSeconds = PerfConfig.ROLLING_STATS_WINDOW_SECONDS;
         tableStatsDetailed = PerfConfig.TABLE_STATS_DETAILED;
         
-        // 初始化滚动统计窗口
+        // 初始化滚动统计窗口 - 现在存储增量而非累计值
         sampleTimestamps = new long[windowSeconds];
-        sampleTotalRows = new long[windowSeconds];
-        sampleJoinRows = new long[windowSeconds];
+        deltaTotalRows = new long[windowSeconds];
+        deltaJoinRows = new long[windowSeconds];
+        deltaLatencyNanos = new long[windowSeconds];
         
-        // 启动滚动统计线程
+        // 初始化各表的增量窗口
+        List.of("buyer_info", "order_main", "order_item").forEach(table -> 
+            deltaTableRows.put(table, new long[windowSeconds])
+        );
+        
+        // 启动滚动统计线程 - 改为每1秒采样一次
         if (rollingEnabled) {
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread thread = new Thread(r, "StatsCollector-rolling");
@@ -216,15 +227,20 @@ public final class StatsCollector {
         joinRows.set(0);
         joinNanos.set(0);
         
+        // 重置滚动统计
         Arrays.fill(sampleTimestamps, 0L);
-        Arrays.fill(sampleTotalRows, 0L);
-        Arrays.fill(sampleJoinRows, 0L);
+        Arrays.fill(deltaTotalRows, 0L);
+        Arrays.fill(deltaJoinRows, 0L);
+        Arrays.fill(deltaLatencyNanos, 0L);
         Arrays.fill(latencySamples, 0L);
-        sampleTableRows.clear();
+        deltaTableRows.values().forEach(arr -> Arrays.fill(arr, 0L));
         sampleIndex = 0;
         
+        // 重置上次采样值
         lastTotalRows = 0;
         lastJoinRows = 0;
+        lastSumBatchNanos = 0;
+        lastCountBatchNanos = 0;
         lastTableRows.values().forEach(v -> v.set(0));
     }
 
@@ -413,75 +429,152 @@ public final class StatsCollector {
     }
 
     /**
-     * 采样并打印滚动统计
+     * 采样并打印滚动统计 - 科学精准版本
      */
     private void sampleAndMaybePrint() {
         try {
             long now = System.currentTimeMillis();
             long currentTotalRows = totalRows.get();
             long currentJoinRows = joinRows.get();
+            long currentSumBatchNanos = sumBatchNanos.get();
+            long currentCountBatchNanos = countBatchNanos.get();
             
-            // 计算1秒增量
-            long deltaTotalRows = currentTotalRows - lastTotalRows;
-            long deltaJoinRows = currentJoinRows - lastJoinRows;
+            // ========== 第一步：计算增量 ==========
+            long deltaRows = currentTotalRows - lastTotalRows;
+            long deltaJoin = currentJoinRows - lastJoinRows;
+            long deltaSumNanos = currentSumBatchNanos - lastSumBatchNanos;
+            long deltaCountBatches = currentCountBatchNanos - lastCountBatchNanos;
             
-            // 更新采样窗口
-            sampleTimestamps[sampleIndex] = now;
-            sampleTotalRows[sampleIndex] = currentTotalRows;
-            sampleJoinRows[sampleIndex] = currentJoinRows;
-            
-            // 记录各表的采样数据
+            // ========== 第二步：计算各表增量 ==========
+            Map<String, Long> tableDeltaMap = new HashMap<>();
             if (tableStatsDetailed) {
-                tableRows.forEach((table, value) -> 
-                    sampleTableRows.computeIfAbsent(table, ignored -> new long[windowSeconds])[sampleIndex] = value.get()
-                );
+                List.of("buyer_info", "order_main", "order_item").forEach(table -> {
+                    long currentTableRowValue = tableRows.getOrDefault(table, new AtomicLong()).get();
+                    long lastTableRowValue = lastTableRows.getOrDefault(table, new AtomicLong()).get();
+                    long tableDelta = currentTableRowValue - lastTableRowValue;
+                    tableDeltaMap.put(table, tableDelta);
+                });
             }
             
+            // ========== 第三步：存储增量到滑动窗口 ==========
+            sampleTimestamps[sampleIndex] = now;
+            deltaTotalRows[sampleIndex] = deltaRows;
+            deltaJoinRows[sampleIndex] = deltaJoin;
+            
+            // 计算此采样周期的平均延迟（如果有批次）
+            long avgLatencyForThisSample = deltaCountBatches > 0 ? deltaSumNanos / deltaCountBatches : 0;
+            deltaLatencyNanos[sampleIndex] = avgLatencyForThisSample;
+            
+            if (tableStatsDetailed) {
+                tableDeltaMap.forEach((table, delta) -> {
+                    long[] tableDeltaArray = deltaTableRows.get(table);
+                    if (tableDeltaArray != null) {
+                        tableDeltaArray[sampleIndex] = delta;
+                    }
+                });
+            }
+            
+            // ========== 第四步：计算滑动窗口统计 ==========
             int currentIndex = sampleIndex;
             sampleIndex = (sampleIndex + 1) % windowSeconds;
             int prevIndex = (currentIndex + windowSeconds - 1) % windowSeconds;
-            int oldestIndex = (currentIndex + 1) % windowSeconds;
             
-            // 计算窗口平均（使用实际时间差）
-            long windowStartTime = sampleTimestamps[oldestIndex];
-            double windowDurationSeconds = windowStartTime > 0 ? (now - windowStartTime) / 1000.0 : windowSeconds;
-            long windowRows = currentTotalRows - sampleTotalRows[oldestIndex];
-            double avgWindowQps = windowDurationSeconds > 0 ? windowRows / windowDurationSeconds : 0.0;
+            // 检查窗口是否已满（至少有第一个有效采样）
+            boolean windowHasData = sampleTimestamps[prevIndex] != 0L;
             
-            // 更新上次采样值
-            lastTotalRows = currentTotalRows;
-            lastJoinRows = currentJoinRows;
-            
-            // 打印实时统计（只有当有有效数据时）
-            if (rollingEnabled && sampleTimestamps[prevIndex] != 0L) {
+            if (windowHasData) {
+                // 计算窗口内总行数
+                long windowTotalRows = 0;
+                long windowJoinRows = 0;
+                long windowTotalLatency = 0;
+                int windowValidLatencySamples = 0;
+                
+                for (int i = 0; i < windowSeconds; i++) {
+                    windowTotalRows += deltaTotalRows[i];
+                    windowJoinRows += deltaJoinRows[i];
+                    
+                    // 只计算有数据的延迟样本
+                    if (deltaLatencyNanos[i] > 0) {
+                        windowTotalLatency += deltaLatencyNanos[i];
+                        windowValidLatencySamples++;
+                    }
+                }
+                
+                // 计算窗口内的实际时间范围
+                long windowStartTime = sampleTimestamps[0];
+                long windowEndTime = sampleTimestamps[currentIndex];
+                double actualWindowSeconds = (windowEndTime - windowStartTime) / 1000.0;
+                
+                // 确保窗口时间合理（至少1秒）
+                if (actualWindowSeconds < 1.0) {
+                    actualWindowSeconds = windowSeconds;
+                }
+                
+                // 计算窗口平均 QPS
+                double avgWindowQps = actualWindowSeconds > 0 ? windowTotalRows / actualWindowSeconds : 0.0;
+                double avgJoinQps = actualWindowSeconds > 0 ? windowJoinRows / actualWindowSeconds : 0.0;
+                
+                // 计算窗口内的平均延迟
+                double avgWindowLatencyMs = windowValidLatencySamples > 0 
+                    ? (windowTotalLatency / windowValidLatencySamples) / 1_000_000.0 
+                    : 0.0;
+                
+                // ========== 第五步：打印统计信息 ==========
                 StringBuilder sb = new StringBuilder();
                 sb.append("\r");
                 sb.append("[实时] ");
-                sb.append(String.format("%-20s", "最近1秒: " + formatNumber(deltaTotalRows) + "行"));
-                sb.append(String.format("%-25s", "| 最近" + windowSeconds + "秒平均: " + formatNumber((long) avgWindowQps) + " QPS"));
                 
-                // 打印各表统计
+                // 最近1秒的行数
+                sb.append(String.format("%-20s", "最近1秒: " + formatNumber(deltaRows) + "行"));
+                
+                // 窗口平均 QPS
+                sb.append(String.format("%-30s", "| 最近" + windowSeconds + "秒平均: " + formatNumber((long) avgWindowQps) + " QPS"));
+                
+                // 各表统计
                 if (tableStatsDetailed) {
                     sb.append("| ");
+                    
+                    // 计算各表在窗口内的总增量
                     List.of("buyer_info", "order_main", "order_item").forEach(table -> {
-                        long currentTableRows = tableRows.getOrDefault(table, new AtomicLong()).get();
-                        long lastTableRowValue = lastTableRows.getOrDefault(table, new AtomicLong()).get();
-                        long deltaTableRows = currentTableRows - lastTableRowValue;
-                        lastTableRows.get(table).set(currentTableRows);
-                        
-                        sb.append(table).append(":").append(formatNumber(deltaTableRows)).append(" ");
+                        long[] tableDeltaArray = deltaTableRows.get(table);
+                        long tableWindowTotal = 0;
+                        if (tableDeltaArray != null) {
+                            for (int i = 0; i < windowSeconds; i++) {
+                                tableWindowTotal += tableDeltaArray[i];
+                            }
+                        }
+                        // 显示最近1秒增量（而非窗口内总增量）
+                        Long deltaForTable = tableDeltaMap.getOrDefault(table, 0L);
+                        sb.append(table).append(":").append(formatNumber(deltaForTable)).append(" ");
                     });
                 }
                 
-                sb.append("| JOIN: ").append(formatNumber(deltaJoinRows)).append("行");
+                // JOIN 统计
+                sb.append("| JOIN: ").append(formatNumber(deltaJoin)).append("行");
                 
-                // 添加延迟统计（最近的平均延迟）
-                long avgLatencyNanos = countBatchNanos.get() > 0 ? sumBatchNanos.get() / countBatchNanos.get() : 0;
-                sb.append(String.format(" | 延迟: %.2fms", avgLatencyNanos / 1_000_000.0));
+                // 延迟统计 - 显示窗口内平均延迟
+                sb.append(String.format(" | 窗口平均延迟: %.2fms", avgWindowLatencyMs));
                 
                 System.out.print(sb);
                 System.out.flush();
             }
+            
+            // ========== 第六步：更新上次采样值 ==========
+            lastTotalRows = currentTotalRows;
+            lastJoinRows = currentJoinRows;
+            lastSumBatchNanos = currentSumBatchNanos;
+            lastCountBatchNanos = currentCountBatchNanos;
+            
+            if (tableStatsDetailed) {
+                tableDeltaMap.forEach((table, delta) -> {
+                    AtomicLong lastVal = lastTableRows.get(table);
+                    if (lastVal != null) {
+                        long currentVal = lastVal.get() + delta;
+                        lastVal.set(currentVal);
+                    }
+                });
+            }
+            
         } catch (Throwable t) {
             t.printStackTrace();
         }
