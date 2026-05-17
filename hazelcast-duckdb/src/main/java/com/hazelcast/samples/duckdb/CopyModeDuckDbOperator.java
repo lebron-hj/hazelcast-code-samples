@@ -15,18 +15,15 @@
  */
 package com.hazelcast.samples.duckdb;
 
-import com.hazelcast.jet.pipeline.ServiceFactory;
-
-import java.io.ByteArrayInputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.*;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * COPY模式DuckDB操作器 - 使用COPY FROM命令实现高性能批量写入
@@ -323,10 +320,10 @@ public class CopyModeDuckDbOperator implements DuckDbOperator {
         int totalRows = batches.size() * 4; // 估算：1 buyer + 1 order + 2-5 items
         StatsCollector.getInstance().recordBatch(batches.size(), totalRows, durationNanos);
         StatsCollector.getInstance().recordJoin(joinCount, System.nanoTime() - startNanos);
-        
+
         // 打印DuckDB性能统计
         StatsCollector.getInstance().printStats();
-        
+
         return allResults;
     }
 
@@ -334,86 +331,131 @@ public class CopyModeDuckDbOperator implements DuckDbOperator {
      * 使用COPY FROM命令批量写入数据
      */
     private void writeBatchesWithCopy(List<EcommerceOrderBatch> batches) throws SQLException {
-        // 写入buyer_info表
-        StringBuilder buyerCsv = new StringBuilder();
-        // 写入order_main表
-        StringBuilder orderCsv = new StringBuilder();
-        // 写入order_item表
-        StringBuilder itemCsv = new StringBuilder();
+        // 使用 HashMap 去重
+        Map<Long, EcommerceBuyer> buyerMap = new HashMap<>();
+        Map<Long, EcommerceOrder> orderMap = new HashMap<>();
+        Map<Long, EcommerceOrderItem> itemMap = new HashMap<>();
         
-        long buyerStart = System.nanoTime();
         for (EcommerceOrderBatch batch : batches) {
             if (batch.buyer() != null) {
-                EcommerceBuyer buyer = batch.buyer();
-                buyerCsv.append(toCsvRow(
-                        buyer.buyerId(),
-                        escapeCsv(buyer.buyerNickname()),
-                        escapeCsv(buyer.buyerRealName()),
-                        escapeCsv(buyer.buyerPhone()),
-                        escapeCsv(buyer.buyerLevel()),
-                        escapeCsv(buyer.registerArea()),
-                        buyer.registerTime()
-                ));
+                buyerMap.put(batch.buyer().buyerId(), batch.buyer());
             }
+            if (batch.order() != null) {
+                orderMap.put(batch.order().orderId(), batch.order());
+            }
+            for (EcommerceOrderItem item : batch.items()) {
+                itemMap.put(item.itemId(), item);
+            }
+        }
+        
+        // 写入buyer_info表 - 先删除已存在的记录
+        StringBuilder buyerCsv = new StringBuilder();
+        long buyerStart = System.nanoTime();
+        for (EcommerceBuyer buyer : buyerMap.values()) {
+            buyerCsv.append(toCsvRow(
+                    buyer.buyerId(),
+                    escapeCsv(buyer.buyerNickname()),
+                    escapeCsv(buyer.buyerRealName()),
+                    escapeCsv(buyer.buyerPhone()),
+                    escapeCsv(buyer.buyerLevel()),
+                    escapeCsv(buyer.registerArea()),
+                    buyer.registerTime()));
         }
         if (buyerCsv.length() > 0) {
+            // 先删除已存在的记录
+            try (Statement stmt = connection.createStatement()) {
+                StringBuilder deleteSql = new StringBuilder("DELETE FROM buyer_info WHERE buyer_id IN (");
+                boolean first = true;
+                for (Long id : buyerMap.keySet()) {
+                    if (!first) {
+                        deleteSql.append(",");
+                    }
+                    deleteSql.append(id);
+                    first = false;
+                }
+                deleteSql.append(")");
+                stmt.execute(deleteSql.toString());
+            }
             executeCopyFromCsv("buyer_info", buyerCsv.toString());
         }
-        StatsCollector.getInstance().recordTableWrite("buyer_info", batches.size(), System.nanoTime() - buyerStart);
+        StatsCollector.getInstance().recordTableWrite("buyer_info", buyerMap.size(), System.nanoTime() - buyerStart);
         
+        // 写入order_main表 - 先删除已存在的记录
+        StringBuilder orderCsv = new StringBuilder();
         long orderStart = System.nanoTime();
-        for (EcommerceOrderBatch batch : batches) {
-            if (batch.order() != null) {
-                EcommerceOrder order = batch.order();
-                orderCsv.append(toCsvRow(
-                        order.orderId(),
-                        escapeCsv(order.orderNo()),
-                        order.buyerId(),
-                        order.createTime(),
-                        order.payTime(),
-                        escapeCsv(order.orderStatus()),
-                        escapeCsv(order.payWay()),
-                        escapeCsv(order.orderChannel()),
-                        order.totalAmount(),
-                        order.payAmount(),
-                        order.freightAmount(),
-                        order.couponAmount(),
-                        escapeCsv(order.receiverName()),
-                        escapeCsv(order.receiverPhone()),
-                        escapeCsv(order.receiverAddress())
-                ));
-            }
+        for (EcommerceOrder order : orderMap.values()) {
+            orderCsv.append(toCsvRow(
+                    order.orderId(),
+                    escapeCsv(order.orderNo()),
+                    order.buyerId(),
+                    order.createTime(),
+                    order.payTime(),
+                    escapeCsv(order.orderStatus()),
+                    escapeCsv(order.payWay()),
+                    escapeCsv(order.orderChannel()),
+                    order.totalAmount(),
+                    order.payAmount(),
+                    order.freightAmount(),
+                    order.couponAmount(),
+                    escapeCsv(order.receiverName()),
+                    escapeCsv(order.receiverPhone()),
+                    escapeCsv(order.receiverAddress())));
         }
         if (orderCsv.length() > 0) {
+            // 先删除已存在的记录
+            try (Statement stmt = connection.createStatement()) {
+                StringBuilder deleteSql = new StringBuilder("DELETE FROM order_main WHERE order_id IN (");
+                boolean first = true;
+                for (Long id : orderMap.keySet()) {
+                    if (!first) {
+                        deleteSql.append(",");
+                    }
+                    deleteSql.append(id);
+                    first = false;
+                }
+                deleteSql.append(")");
+                stmt.execute(deleteSql.toString());
+            }
             executeCopyFromCsv("order_main", orderCsv.toString());
         }
-        StatsCollector.getInstance().recordTableWrite("order_main", batches.size(), System.nanoTime() - orderStart);
+        StatsCollector.getInstance().recordTableWrite("order_main", orderMap.size(), System.nanoTime() - orderStart);
         
+        // 写入order_item表 - 先删除已存在的记录
+        StringBuilder itemCsv = new StringBuilder();
         long itemStart = System.nanoTime();
         int itemCount = 0;
-        for (EcommerceOrderBatch batch : batches) {
-            if (batch.items() != null) {
-                for (EcommerceOrderItem item : batch.items()) {
-                    itemCsv.append(toCsvRow(
-                            item.itemId(),
-                            item.orderId(),
-                            escapeCsv(item.spuNo()),
-                            escapeCsv(item.skuNo()),
-                            escapeCsv(item.goodsName()),
-                            escapeCsv(item.category1()),
-                            escapeCsv(item.category2()),
-                            escapeCsv(item.brandName()),
-                            item.originalPrice(),
-                            item.salePrice(),
-                            item.buyNum(),
-                            item.itemSubtotal(),
-                            escapeCsv(item.goodsSpec())
-                    ));
-                    itemCount++;
-                }
-            }
+        for (EcommerceOrderItem item : itemMap.values()) {
+            itemCsv.append(toCsvRow(
+                    item.itemId(),
+                    item.orderId(),
+                    escapeCsv(item.spuNo()),
+                    escapeCsv(item.skuNo()),
+                    escapeCsv(item.goodsName()),
+                    escapeCsv(item.category1()),
+                    escapeCsv(item.category2()),
+                    escapeCsv(item.brandName()),
+                    item.originalPrice(),
+                    item.salePrice(),
+                    item.buyNum(),
+                    item.itemSubtotal(),
+                    escapeCsv(item.goodsSpec())));
+            itemCount++;
         }
         if (itemCsv.length() > 0) {
+            // 先删除已存在的记录
+            try (Statement stmt = connection.createStatement()) {
+                StringBuilder deleteSql = new StringBuilder("DELETE FROM order_item WHERE item_id IN (");
+                boolean first = true;
+                for (Long id : itemMap.keySet()) {
+                    if (!first) {
+                        deleteSql.append(",");
+                    }
+                    deleteSql.append(id);
+                    first = false;
+                }
+                deleteSql.append(")");
+                stmt.execute(deleteSql.toString());
+            }
             executeCopyFromCsv("order_item", itemCsv.toString());
         }
         StatsCollector.getInstance().recordTableWrite("order_item", itemCount, System.nanoTime() - itemStart);
@@ -423,72 +465,37 @@ public class CopyModeDuckDbOperator implements DuckDbOperator {
      * 执行COPY FROM CSV命令
      */
     private void executeCopyFromCsv(String tableName, String csvData) throws SQLException {
-        String sql = String.format("COPY %s FROM stdin (FORMAT CSV)", tableName);
-        
-        try (Statement stmt = connection.createStatement()) {
-            // DuckDB的COPY FROM stdin需要使用特殊方式
-            // 使用JDBC的setAsciiStream或类似方法
-            
-            // 另一种方式：使用临时文件或内存中的CSV数据
-            // 这里我们使用字符串输入流
-            ByteArrayInputStream inputStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
-            
-            // DuckDB JDBC支持通过Statement.execute执行COPY命令
-            // 但需要特殊处理，这里使用更通用的INSERT方式作为fallback
-            // 对于大量数据，COPY命令会更高效
-            
-            // 由于DuckDB JDBC对COPY FROM stdin的支持有限，
-            // 我们使用INSERT ... ON CONFLICT作为备选方案
-            // 实际生产环境中可以使用文件或管道方式
-            executeBatchInsert(tableName, csvData);
+        if (csvData == null || csvData.isBlank()) {
+            return;
+        }
+
+        Path tempFile = null;
+        try {
+            tempFile = Files.createTempFile("duckdb-copy-", ".csv");
+            Files.writeString(tempFile, csvData, StandardCharsets.UTF_8);
+
+            String escapedPath = tempFile.toAbsolutePath().toString().replace("'", "''");
+            String sql = String.format(
+                    "COPY %s FROM '%s' (FORMAT CSV, NULL 'NULL', QUOTE '\"', ESCAPE '\"')",
+                    tableName,
+                    escapedPath);
+
+            try (Statement stmt = connection.createStatement()) {
+                stmt.execute(sql);
+            }
+        } catch (Exception e) {
+            throw new SQLException("COPY FROM failed for table " + tableName, e);
+        } finally {
+            if (tempFile != null) {
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (Exception ignored) {
+                    // ignore cleanup failures
+                }
+            }
         }
     }
 
-    /**
-     * 批量INSERT作为COPY的备选方案（当COPY FROM stdin不可用时）
-     */
-    private void executeBatchInsert(String tableName, String csvData) throws SQLException {
-        String sql = null;
-        PreparedStatement pstmt = null;
-        
-        try {
-            switch (tableName) {
-                case "buyer_info":
-                    sql = "INSERT OR REPLACE INTO buyer_info (buyer_id, buyer_nickname, buyer_real_name, buyer_phone, buyer_level, register_area, register_time) VALUES (?, ?, ?, ?, ?, ?, ?)";
-                    pstmt = connection.prepareStatement(sql);
-                    break;
-                case "order_main":
-                    sql = "INSERT OR REPLACE INTO order_main (order_id, order_no, buyer_id, create_time, pay_time, order_status, pay_way, order_channel, total_amount, pay_amount, freight_amount, coupon_amount, receiver_name, receiver_phone, receiver_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                    pstmt = connection.prepareStatement(sql);
-                    break;
-                case "order_item":
-                    sql = "INSERT OR REPLACE INTO order_item (item_id, order_id, spu_no, sku_no, goods_name, category1, category2, brand_name, original_price, sale_price, buy_num, item_subtotal, goods_spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                    pstmt = connection.prepareStatement(sql);
-                    break;
-                default:
-                    throw new SQLException("Unknown table: " + tableName);
-            }
-            
-            String[] lines = csvData.split("\n");
-            for (String line : lines) {
-                String[] values = parseCsvLine(line);
-                for (int i = 0; i < values.length; i++) {
-                    setPreparedStatementValue(pstmt, i + 1, values[i]);
-                }
-                pstmt.addBatch();
-            }
-            
-            pstmt.executeBatch();
-            pstmt.clearBatch();
-        } finally {
-            if (pstmt != null) {
-                try {
-                    pstmt.close();
-                } catch (SQLException ignored) {
-                }
-            }
-        }
-    }
 
     /**
      * 设置PreparedStatement参数值

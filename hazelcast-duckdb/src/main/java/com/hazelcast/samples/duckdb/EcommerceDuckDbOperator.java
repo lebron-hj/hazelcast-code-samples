@@ -22,6 +22,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -524,6 +525,23 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
             long joinStartNanos = System.nanoTime();
             int joinCount = 0;
             
+            // 使用 HashMap 去重
+            Map<Long, EcommerceBuyer> buyerMap = new HashMap<>();
+            Map<Long, EcommerceOrder> orderMap = new HashMap<>();
+            Map<Long, EcommerceOrderItem> itemMap = new HashMap<>();
+            
+            for (EcommerceOrderBatch batch : batches) {
+                if (batch.buyer() != null) {
+                    buyerMap.put(batch.buyer().buyerId(), batch.buyer());
+                }
+                if (batch.order() != null) {
+                    orderMap.put(batch.order().orderId(), batch.order());
+                }
+                for (EcommerceOrderItem item : batch.items()) {
+                    itemMap.put(item.itemId(), item);
+                }
+            }
+            
             // 先批量处理所有删除操作
             for (EcommerceOrderBatch batch : batches) {
                 for (Long orderId : batch.deleteOrderIds()) {
@@ -532,18 +550,16 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
             }
             
             // 批量 upsert buyer_info（使用 addBatch）
-            for (EcommerceOrderBatch batch : batches) {
-                if (batch.buyer() != null) {
-                    upsertBuyer.setLong(1, batch.buyer().buyerId());
-                    upsertBuyer.setString(2, batch.buyer().buyerNickname());
-                    upsertBuyer.setString(3, batch.buyer().buyerRealName());
-                    upsertBuyer.setString(4, batch.buyer().buyerPhone());
-                    upsertBuyer.setString(5, batch.buyer().buyerLevel());
-                    upsertBuyer.setString(6, batch.buyer().registerArea());
-                    upsertBuyer.setLong(7, batch.buyer().registerTime());
-                    upsertBuyer.addBatch();
-                    buyerCount++;
-                }
+            for (EcommerceBuyer buyer : buyerMap.values()) {
+                upsertBuyer.setLong(1, buyer.buyerId());
+                upsertBuyer.setString(2, buyer.buyerNickname());
+                upsertBuyer.setString(3, buyer.buyerRealName());
+                upsertBuyer.setString(4, buyer.buyerPhone());
+                upsertBuyer.setString(5, buyer.buyerLevel());
+                upsertBuyer.setString(6, buyer.registerArea());
+                upsertBuyer.setLong(7, buyer.registerTime());
+                upsertBuyer.addBatch();
+                buyerCount++;
             }
             if (buyerCount > 0) {
                 upsertBuyer.executeBatch();
@@ -552,27 +568,24 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
             StatsCollector.getInstance().recordTableWrite("buyer_info", buyerCount, System.nanoTime() - buyerStartNanos);
             
             // 批量 upsert order_main（使用 addBatch）
-            for (EcommerceOrderBatch batch : batches) {
-                if (batch.order() != null) {
-                    EcommerceOrder order = batch.order();
-                    upsertOrderMain.setLong(1, order.orderId());
-                    upsertOrderMain.setString(2, order.orderNo());
-                    upsertOrderMain.setLong(3, order.buyerId());
-                    upsertOrderMain.setLong(4, order.createTime());
-                    upsertOrderMain.setLong(5, order.payTime());
-                    upsertOrderMain.setString(6, order.orderStatus());
-                    upsertOrderMain.setString(7, order.payWay());
-                    upsertOrderMain.setString(8, order.orderChannel());
-                    upsertOrderMain.setDouble(9, order.totalAmount());
-                    upsertOrderMain.setDouble(10, order.payAmount());
-                    upsertOrderMain.setDouble(11, order.freightAmount());
-                    upsertOrderMain.setDouble(12, order.couponAmount());
-                    upsertOrderMain.setString(13, order.receiverName());
-                    upsertOrderMain.setString(14, order.receiverPhone());
-                    upsertOrderMain.setString(15, order.receiverAddress());
-                    upsertOrderMain.addBatch();
-                    orderCount++;
-                }
+            for (EcommerceOrder order : orderMap.values()) {
+                upsertOrderMain.setLong(1, order.orderId());
+                upsertOrderMain.setString(2, order.orderNo());
+                upsertOrderMain.setLong(3, order.buyerId());
+                upsertOrderMain.setLong(4, order.createTime());
+                upsertOrderMain.setLong(5, order.payTime());
+                upsertOrderMain.setString(6, order.orderStatus());
+                upsertOrderMain.setString(7, order.payWay());
+                upsertOrderMain.setString(8, order.orderChannel());
+                upsertOrderMain.setDouble(9, order.totalAmount());
+                upsertOrderMain.setDouble(10, order.payAmount());
+                upsertOrderMain.setDouble(11, order.freightAmount());
+                upsertOrderMain.setDouble(12, order.couponAmount());
+                upsertOrderMain.setString(13, order.receiverName());
+                upsertOrderMain.setString(14, order.receiverPhone());
+                upsertOrderMain.setString(15, order.receiverAddress());
+                upsertOrderMain.addBatch();
+                orderCount++;
             }
             if (orderCount > 0) {
                 upsertOrderMain.executeBatch();
@@ -581,24 +594,22 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
             StatsCollector.getInstance().recordTableWrite("order_main", orderCount, System.nanoTime() - orderStartNanos);
             
             // 批量 upsert order_item（使用 addBatch）
-            for (EcommerceOrderBatch batch : batches) {
-                for (EcommerceOrderItem item : batch.items()) {
-                    upsertOrderItem.setLong(1, item.itemId());
-                    upsertOrderItem.setLong(2, item.orderId());
-                    upsertOrderItem.setString(3, item.spuNo());
-                    upsertOrderItem.setString(4, item.skuNo());
-                    upsertOrderItem.setString(5, item.goodsName());
-                    upsertOrderItem.setString(6, item.category1());
-                    upsertOrderItem.setString(7, item.category2());
-                    upsertOrderItem.setString(8, item.brandName());
-                    upsertOrderItem.setDouble(9, item.originalPrice());
-                    upsertOrderItem.setDouble(10, item.salePrice());
-                    upsertOrderItem.setInt(11, item.buyNum());
-                    upsertOrderItem.setDouble(12, item.itemSubtotal());
-                    upsertOrderItem.setString(13, item.goodsSpec());
-                    upsertOrderItem.addBatch();
-                    itemCount++;
-                }
+            for (EcommerceOrderItem item : itemMap.values()) {
+                upsertOrderItem.setLong(1, item.itemId());
+                upsertOrderItem.setLong(2, item.orderId());
+                upsertOrderItem.setString(3, item.spuNo());
+                upsertOrderItem.setString(4, item.skuNo());
+                upsertOrderItem.setString(5, item.goodsName());
+                upsertOrderItem.setString(6, item.category1());
+                upsertOrderItem.setString(7, item.category2());
+                upsertOrderItem.setString(8, item.brandName());
+                upsertOrderItem.setDouble(9, item.originalPrice());
+                upsertOrderItem.setDouble(10, item.salePrice());
+                upsertOrderItem.setInt(11, item.buyNum());
+                upsertOrderItem.setDouble(12, item.itemSubtotal());
+                upsertOrderItem.setString(13, item.goodsSpec());
+                upsertOrderItem.addBatch();
+                itemCount++;
             }
             if (itemCount > 0) {
                 upsertOrderItem.executeBatch();
@@ -610,12 +621,7 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
             connection.commit();
             
             // 执行宽表查询（批量查询，一次性查询所有orderId）
-            List<Long> orderIds = new ArrayList<>();
-            for (EcommerceOrderBatch batch : batches) {
-                if (batch.order() != null) {
-                    orderIds.add(batch.order().orderId());
-                }
-            }
+            List<Long> orderIds = new ArrayList<>(orderMap.keySet());
             if (!orderIds.isEmpty()) {
                 List<Map<String, Object>> rows = queryWideRowsBatch(orderIds);
                 allResults.addAll(rows);
