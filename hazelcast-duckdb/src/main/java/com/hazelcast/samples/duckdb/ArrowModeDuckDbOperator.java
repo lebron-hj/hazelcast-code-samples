@@ -83,9 +83,6 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
     // Arrow内存分配器
     private final BufferAllocator allocator;
     
-    // 累积查询结果
-    private final List<Map<String, Object>> accumulatedResults = new ArrayList<>();
-
     // 锁对象，防止多个线程同时访问 operator
     private final Object lock = new Object();
 
@@ -246,7 +243,6 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 if (!orderIds.isEmpty()) {
                     rows = queryWideRowsBatch(orderIds);
                     StatsCollector.getInstance().recordJoin(rows.size(), System.nanoTime() - startTime);
-                    accumulatedResults.addAll(rows);
                 }
                 // 打印DuckDB性能统计（类似HighPerformanceDataGenerator的printStats）
                 StatsCollector.getInstance().printStats();
@@ -1050,14 +1046,4 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         }
     }
 
-    /**
-     * 获取累积的查询结果
-     */
-    public List<Map<String, Object>> getAccumulatedResults() {
-        synchronized (accumulatedResults) {
-            List<Map<String, Object>> results = new ArrayList<>(accumulatedResults);
-            accumulatedResults.clear();
-            return results;
-        }
-    }
 }

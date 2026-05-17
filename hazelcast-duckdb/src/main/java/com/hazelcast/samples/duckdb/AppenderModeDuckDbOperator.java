@@ -61,9 +61,6 @@ public class AppenderModeDuckDbOperator implements DuckDbOperator {
     private final long batchWritingTimeoutMs;
     private final Collection<EcommerceOrderBatch> batchBuffer = new ConcurrentLinkedQueue<>();
     
-    // 累积查询结果
-    private final List<Map<String, Object>> accumulatedResults = new ArrayList<>();
-
     public AppenderModeDuckDbOperator() throws SQLException {
         this.batchWritingEnabled = PerfConfig.BATCH_WRITING_ENABLED;
         this.batchWritingSize = PerfConfig.BATCH_WRITING_SIZE;
@@ -221,9 +218,6 @@ public class AppenderModeDuckDbOperator implements DuckDbOperator {
         
         // 执行批量写入和查询
         List<Map<String, Object>> results = performTransaction(buyerMap, orderMap, itemMap);
-        
-        // 累积结果（用于攒批模式的最终返回）
-        accumulatedResults.addAll(results);
         
         // 记录统计信息
         int totalRows = buyerMap.size() + orderMap.size() + itemMap.size();

@@ -121,7 +121,9 @@ public final class HazelcastDuckDbJob {
                             closeOperator()),
                     (operator, batch) -> processBatchWithOperator(operator, batch))
             .flatMap(iterable -> Traversers.traverseIterable(iterable))
-            .writeTo(Sinks.list(PerfConfig.RESULT_LIST_NAME));
+            .writeTo(Sinks.noop());
+//            .writeTo(Sinks.logger());
+//            .writeTo(Sinks.list(PerfConfig.RESULT_LIST_NAME));
         } else {
             stage.mapUsingService(
                     ServiceFactories.nonSharedService(
@@ -129,7 +131,9 @@ public final class HazelcastDuckDbJob {
                             closeOperator()),
                     (operator, batch) -> processBatchWithOperator(operator, batch))
             .flatMap(iterable -> Traversers.traverseIterable(iterable))
-            .writeTo(Sinks.list(PerfConfig.RESULT_LIST_NAME));
+            .writeTo(Sinks.noop());
+//            .writeTo(Sinks.logger());
+//            .writeTo(Sinks.list(PerfConfig.RESULT_LIST_NAME));
         }
         
         // 提交作业但不等待完成（无限流）
