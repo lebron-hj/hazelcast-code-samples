@@ -179,7 +179,8 @@ public final class PerfConfig {
             // - 禁用检查点
             // - 启用对象缓存
             int cpuCores = Runtime.getRuntime().availableProcessors();
-            jdbcUrl = String.format("jdbc:duckdb:memory:?memory_limit=8GB&threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
+//            jdbcUrl = String.format("jdbc:duckdb:memory:?memory_limit=8GB&threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
+            jdbcUrl = String.format("jdbc:duckdb:memory:?threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
         }
         DUCKDB_JDBC_URL = jdbcUrl;
 

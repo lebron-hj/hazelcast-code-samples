@@ -75,6 +75,27 @@
                 <version>3.5.4</version>
                 <configuration>
                     <useModulePath>false</useModulePath>
+                    <argLine>
+                        --add-opens=java.base/java.nio=ALL-UNNAMED
+                    </argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.6.3</version>
+                <configuration>
+                    <mainClass>com.hazelcast.samples.duckdb.HazelcastDuckDbApplication</mainClass>
+                    <commandlineArgs>1</commandlineArgs>
+                    <systemProperties>
+                        <systemProperty>
+                            <key>duckdb.write.mode</key>
+                            <value>arrow</value>
+                        </systemProperty>
+                    </systemProperties>
+                    <additionalClasspathElements/>
+                    <arguments/>
+<!--                    <argLine>&#45;&#45;add-opens=java.base/java.nio=ALL-UNNAMED</argLine>-->
                 </configuration>
             </plugin>
         </plugins>

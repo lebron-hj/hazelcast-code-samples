@@ -15,8 +15,12 @@
  */
 package com.hazelcast.samples.duckdb;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BaseVariableWidthVector;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -29,8 +33,6 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.duckdb.DuckDBConnection;
 
@@ -66,6 +68,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * - ARROW模式：QPS约20000-50000+
  */
 public class ArrowModeDuckDbOperator implements DuckDbOperator {
+    private static final int ARROW_INITIAL_CAPACITY = 1024 * 1024;
 
     private final Connection connection;
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -82,6 +85,9 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
     
     // 累积查询结果
     private final List<Map<String, Object>> accumulatedResults = new ArrayList<>();
+
+    // 锁对象，防止多个线程同时访问 operator
+    private final Object lock = new Object();
 
     public ArrowModeDuckDbOperator() throws SQLException {
         this.batchWritingEnabled = PerfConfig.BATCH_WRITING_ENABLED;
@@ -100,54 +106,67 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
     }
 
     private void initTables() throws SQLException {
-        try (Statement stmt = connection.createStatement()) {
-            // 创建买家信息表
-            stmt.execute("CREATE TABLE IF NOT EXISTS buyer_info (" +
-                    "buyer_id BIGINT PRIMARY KEY, " +
-                    "buyer_nickname VARCHAR, " +
-                    "buyer_real_name VARCHAR, " +
-                    "buyer_phone VARCHAR, " +
-                    "buyer_level VARCHAR, " +
-                    "register_area VARCHAR, " +
-                    "register_time TIMESTAMP" +
-                    ")");
+        boolean originalAutoCommit = connection.getAutoCommit();
+        try {
+            connection.setAutoCommit(true);
+            try (Statement stmt = connection.createStatement()) {
+                // 创建买家信息表
+                try {
+                    stmt.execute("CREATE TABLE IF NOT EXISTS buyer_info (" +
+                            "buyer_id BIGINT PRIMARY KEY, " +
+                            "buyer_nickname VARCHAR, " +
+                            "buyer_real_name VARCHAR, " +
+                            "buyer_phone VARCHAR, " +
+                            "buyer_level VARCHAR, " +
+                            "register_area VARCHAR, " +
+                            "register_time TIMESTAMP" +
+                            ")");
+                } catch (SQLException ignored) {
+                    // 忽略 catalog write-write conflict 异常，因为表可能已经被其他连接创建了
+                }
 
-            // 创建订单主表
-            stmt.execute("CREATE TABLE IF NOT EXISTS order_main (" +
-                    "order_id BIGINT PRIMARY KEY, " +
-                    "order_no VARCHAR, " +
-                    "buyer_id BIGINT, " +
-                    "order_status VARCHAR, " +
-                    "pay_status VARCHAR, " +
-                    "order_amount DOUBLE, " +
-                    "pay_amount DOUBLE, " +
-                    "freight_amount DOUBLE, " +
-                    "discount_amount DOUBLE, " +
-                    "create_time TIMESTAMP, " +
-                    "pay_time TIMESTAMP" +
-                    ")");
+                // 创建订单主表
+                try {
+                    stmt.execute("CREATE TABLE IF NOT EXISTS order_main (" +
+                            "order_id BIGINT PRIMARY KEY, " +
+                            "order_no VARCHAR, " +
+                            "buyer_id BIGINT, " +
+                            "order_status VARCHAR, " +
+                            "pay_status VARCHAR, " +
+                            "order_amount DOUBLE, " +
+                            "pay_amount DOUBLE, " +
+                            "freight_amount DOUBLE, " +
+                            "discount_amount DOUBLE, " +
+                            "create_time TIMESTAMP, " +
+                            "pay_time TIMESTAMP" +
+                            ")");
+                } catch (SQLException ignored) {
+                    // 忽略 catalog write-write conflict 异常
+                }
 
-            // 创建订单项表
-            stmt.execute("CREATE TABLE IF NOT EXISTS order_item (" +
-                    "item_id BIGINT PRIMARY KEY, " +
-                    "order_id BIGINT, " +
-                    "spu_no VARCHAR, " +
-                    "sku_no VARCHAR, " +
-                    "goods_name VARCHAR, " +
-                    "category1 VARCHAR, " +
-                    "category2 VARCHAR, " +
-                    "brand_name VARCHAR, " +
-                    "original_price DOUBLE, " +
-                    "sale_price DOUBLE, " +
-                    "buy_num INT, " +
-                    "item_subtotal DOUBLE, " +
-                    "goods_spec VARCHAR" +
-                    ")");
-            
-            connection.commit();
-        } catch (SQLException e) {
-            connection.rollback();
-            throw e;
+                // 创建订单项表
+                try {
+                    stmt.execute("CREATE TABLE IF NOT EXISTS order_item (" +
+                            "item_id BIGINT PRIMARY KEY, " +
+                            "order_id BIGINT, " +
+                            "spu_no VARCHAR, " +
+                            "sku_no VARCHAR, " +
+                            "goods_name VARCHAR, " +
+                            "category1 VARCHAR, " +
+                            "category2 VARCHAR, " +
+                            "brand_name VARCHAR, " +
+                            "original_price DOUBLE, " +
+                            "sale_price DOUBLE, " +
+                            "buy_num INT, " +
+                            "item_subtotal DOUBLE, " +
+                            "goods_spec VARCHAR" +
+                            ")");
+                } catch (SQLException ignored) {
+                    // 忽略 catalog write-write conflict 异常
+                }
+            }
+        } finally {
+            connection.setAutoCommit(originalAutoCommit);
         }
     }
 
@@ -156,20 +175,22 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
      */
     @Override
     public List<Map<String, Object>> processBatch(EcommerceOrderBatch batch) throws SQLException {
-        if (closed.get()) {
-            throw new IllegalStateException("Operator has been closed");
-        }
-
-        if (batchWritingEnabled) {
-            batchBuffer.add(batch);
-            
-            if (batchBuffer.size() >= batchWritingSize) {
-                return flush();
+        synchronized (lock) {
+            if (closed.get()) {
+                throw new IllegalStateException("Operator has been closed");
             }
-            lastFlushTime.set(System.currentTimeMillis());
-            return Collections.emptyList();
-        } else {
-            return processBatchInternal(Collections.singletonList(batch));
+
+            if (batchWritingEnabled) {
+                batchBuffer.add(batch);
+                
+                if (batchBuffer.size() >= batchWritingSize) {
+                    return flush();
+                }
+                lastFlushTime.set(System.currentTimeMillis());
+                return Collections.emptyList();
+            } else {
+                return processBatchInternal(Collections.singletonList(batch));
+            }
         }
     }
 
@@ -177,52 +198,67 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
      * 使用Arrow VectorSchemaRoot实现零拷贝批量写入
      */
     private List<Map<String, Object>> processBatchInternal(Collection<EcommerceOrderBatch> batches) throws SQLException {
-        long startTime = System.nanoTime();
-        
-        try {
-            // 提取所有数据
-            List<EcommerceBuyer> buyers = new ArrayList<>();
-            List<EcommerceOrder> orders = new ArrayList<>();
-            List<EcommerceOrderItem> items = new ArrayList<>();
+        synchronized (lock) {
+            long startTime = System.nanoTime();
             
-            for (EcommerceOrderBatch batch : batches) {
-                if (batch.buyer() != null) {
-                    buyers.add(batch.buyer());
-                }
-                if (batch.order() != null) {
-                    orders.add(batch.order());
-                }
-                items.addAll(batch.items());
-            }
-            
-            // 使用Arrow VectorSchemaRoot零拷贝写入
-            writeBuyersWithArrow(buyers);
-            writeOrdersWithArrow(orders);
-            writeOrderItemsWithArrow(items);
-            
-            connection.commit();
-            
-            // 更新统计
-            StatsCollector.getInstance().recordBatch(batches.size(), 
-                    batches.stream().mapToLong(b -> b.items().size() + 2).sum(), 
-                    System.nanoTime() - startTime);
-            
-            // 执行宽表查询（批量查询）
-            List<Long> orderIds = orders.stream().map(EcommerceOrder::orderId).toList();
-            if (!orderIds.isEmpty()) {
-                List<Map<String, Object>> rows = queryWideRowsBatch(orderIds);
-                StatsCollector.getInstance().recordJoin(rows.size(), System.nanoTime() - startTime);
-                accumulatedResults.addAll(rows);
-                return rows;
-            }
-            
-            return Collections.emptyList();
-            
-        } catch (SQLException e) {
             try {
-                connection.rollback();
-            } catch (SQLException ignored) {}
-            throw new RuntimeException("Failed to write batches", e);
+                // 确保连接有活跃的事务
+                if (connection.getAutoCommit()) {
+                    connection.setAutoCommit(false);
+                }
+                
+                // 提取所有数据并去重（避免重复主键）
+                Map<Long, EcommerceBuyer> buyerMap = new HashMap<>();
+                Map<Long, EcommerceOrder> orderMap = new HashMap<>();
+                Map<Long, EcommerceOrderItem> itemMap = new HashMap<>();
+                
+                for (EcommerceOrderBatch batch : batches) {
+                    if (batch.buyer() != null) {
+                        buyerMap.put(batch.buyer().buyerId(), batch.buyer());
+                    }
+                    if (batch.order() != null) {
+                        orderMap.put(batch.order().orderId(), batch.order());
+                    }
+                    for (EcommerceOrderItem item : batch.items()) {
+                        itemMap.put(item.itemId(), item);
+                    }
+                }
+                
+                List<EcommerceBuyer> buyers = new ArrayList<>(buyerMap.values());
+                List<EcommerceOrder> orders = new ArrayList<>(orderMap.values());
+                List<EcommerceOrderItem> items = new ArrayList<>(itemMap.values());
+                
+                // 使用Arrow VectorSchemaRoot写入
+                writeBuyersWithArrow(buyers);
+                writeOrdersWithArrow(orders);
+                writeOrderItemsWithArrow(items);
+                
+                connection.commit();
+                
+                // 更新统计
+                StatsCollector.getInstance().recordBatch(batches.size(), 
+                        batches.stream().mapToLong(b -> b.items().size() + 2).sum(), 
+                        System.nanoTime() - startTime);
+
+                // 执行宽表查询（批量查询）
+                List<Map<String, Object>> rows = Collections.emptyList();
+                List<Long> orderIds = orders.stream().map(EcommerceOrder::orderId).toList();
+                if (!orderIds.isEmpty()) {
+                    rows = queryWideRowsBatch(orderIds);
+                    StatsCollector.getInstance().recordJoin(rows.size(), System.nanoTime() - startTime);
+                    accumulatedResults.addAll(rows);
+                }
+                // 打印DuckDB性能统计（类似HighPerformanceDataGenerator的printStats）
+                StatsCollector.getInstance().printStats();
+                
+                return rows;
+                
+            } catch (SQLException e) {
+                try {
+                    connection.rollback();
+                } catch (SQLException ignored) {}
+                throw new RuntimeException("Failed to write batches", e);
+            }
         }
     }
 
@@ -251,17 +287,39 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
             VarCharVector levelVec = (VarCharVector) root.getVector("buyer_level");
             VarCharVector areaVec = (VarCharVector) root.getVector("register_area");
             TimeStampMilliVector registerTimeVec = (TimeStampMilliVector) root.getVector("register_time");
-            
+
+            int rowCount = buyers.size();
+            int nicknameBytes = 0;
+            int realNameBytes = 0;
+            int phoneBytes = 0;
+            int levelBytes = 0;
+            int areaBytes = 0;
+            for (EcommerceBuyer buyer : buyers) {
+                nicknameBytes += estimateUtf8Bytes(buyer.buyerNickname());
+                realNameBytes += estimateUtf8Bytes(buyer.buyerRealName());
+                phoneBytes += estimateUtf8Bytes(buyer.buyerPhone());
+                levelBytes += estimateUtf8Bytes(buyer.buyerLevel());
+                areaBytes += estimateUtf8Bytes(buyer.registerArea());
+            }
+
+            buyerIdVec.allocateNew(rowCount);
+            registerTimeVec.allocateNew(rowCount);
+            preallocateVarCharVector(nicknameVec, rowCount, nicknameBytes);
+            preallocateVarCharVector(realNameVec, rowCount, realNameBytes);
+            preallocateVarCharVector(phoneVec, rowCount, phoneBytes);
+            preallocateVarCharVector(levelVec, rowCount, levelBytes);
+            preallocateVarCharVector(areaVec, rowCount, areaBytes);
+
             // 填充数据
             for (int i = 0; i < buyers.size(); i++) {
                 EcommerceBuyer buyer = buyers.get(i);
                 
                 buyerIdVec.set(i, buyer.buyerId());
-                nicknameVec.set(i, buyer.buyerNickname().getBytes(StandardCharsets.UTF_8));
-                realNameVec.set(i, buyer.buyerRealName().getBytes(StandardCharsets.UTF_8));
-                phoneVec.set(i, buyer.buyerPhone().getBytes(StandardCharsets.UTF_8));
-                levelVec.set(i, buyer.buyerLevel().getBytes(StandardCharsets.UTF_8));
-                areaVec.set(i, buyer.registerArea().getBytes(StandardCharsets.UTF_8));
+                safeSetVariableWidthField(nicknameVec, i, buyer.buyerNickname());
+                safeSetVariableWidthField(realNameVec, i, buyer.buyerRealName());
+                safeSetVariableWidthField(phoneVec, i, buyer.buyerPhone());
+                safeSetVariableWidthField(levelVec, i, buyer.buyerLevel());
+                safeSetVariableWidthField(areaVec, i, buyer.registerArea());
                 registerTimeVec.set(i, buyer.registerTime());
             }
             
@@ -303,16 +361,38 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
             Float8Vector discountVec = (Float8Vector) root.getVector("discount_amount");
             TimeStampMilliVector createTimeVec = (TimeStampMilliVector) root.getVector("create_time");
             TimeStampMilliVector payTimeVec = (TimeStampMilliVector) root.getVector("pay_time");
-            
+
+            int rowCount = orders.size();
+            int orderNoBytes = 0;
+            int statusBytes = 0;
+            int payStatusBytes = 0;
+            for (EcommerceOrder order : orders) {
+                orderNoBytes += estimateUtf8Bytes(order.orderNo());
+                statusBytes += estimateUtf8Bytes(order.orderStatus());
+                payStatusBytes += estimateUtf8Bytes(order.payWay());
+            }
+
+            orderIdVec.allocateNew(rowCount);
+            buyerIdVec.allocateNew(rowCount);
+            amountVec.allocateNew(rowCount);
+            payAmountVec.allocateNew(rowCount);
+            freightVec.allocateNew(rowCount);
+            discountVec.allocateNew(rowCount);
+            createTimeVec.allocateNew(rowCount);
+            payTimeVec.allocateNew(rowCount);
+            preallocateVarCharVector(orderNoVec, rowCount, orderNoBytes);
+            preallocateVarCharVector(statusVec, rowCount, statusBytes);
+            preallocateVarCharVector(payStatusVec, rowCount, payStatusBytes);
+
             // 填充数据
             for (int i = 0; i < orders.size(); i++) {
                 EcommerceOrder order = orders.get(i);
                 
                 orderIdVec.set(i, order.orderId());
-                orderNoVec.set(i, order.orderNo().getBytes(StandardCharsets.UTF_8));
+                safeSetVariableWidthField(orderNoVec, i, order.orderNo());
                 buyerIdVec.set(i, order.buyerId());
-                statusVec.set(i, order.orderStatus().getBytes(StandardCharsets.UTF_8));
-                payStatusVec.set(i, order.payWay().getBytes(StandardCharsets.UTF_8));
+                safeSetVariableWidthField(statusVec, i, order.orderStatus());
+                safeSetVariableWidthField(payStatusVec, i, order.payWay());
                 amountVec.set(i, order.totalAmount());
                 payAmountVec.set(i, order.payAmount());
                 freightVec.set(i, order.freightAmount());
@@ -361,24 +441,56 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
             IntVector buyNumVec = (IntVector) root.getVector("buy_num");
             Float8Vector subtotalVec = (Float8Vector) root.getVector("item_subtotal");
             VarCharVector specVec = (VarCharVector) root.getVector("goods_spec");
-            
+
+            int rowCount = items.size();
+            int spuNoBytes = 0;
+            int skuNoBytes = 0;
+            int goodsNameBytes = 0;
+            int category1Bytes = 0;
+            int category2Bytes = 0;
+            int brandNameBytes = 0;
+            int specBytes = 0;
+            for (EcommerceOrderItem item : items) {
+                spuNoBytes += estimateUtf8Bytes(item.spuNo());
+                skuNoBytes += estimateUtf8Bytes(item.skuNo());
+                goodsNameBytes += estimateUtf8Bytes(item.goodsName());
+                category1Bytes += estimateUtf8Bytes(item.category1());
+                category2Bytes += estimateUtf8Bytes(item.category2());
+                brandNameBytes += estimateUtf8Bytes(item.brandName());
+                specBytes += estimateUtf8Bytes(item.goodsSpec());
+            }
+
+            itemIdVec.allocateNew(rowCount);
+            orderIdVec.allocateNew(rowCount);
+            originalPriceVec.allocateNew(rowCount);
+            salePriceVec.allocateNew(rowCount);
+            buyNumVec.allocateNew(rowCount);
+            subtotalVec.allocateNew(rowCount);
+            preallocateVarCharVector(spuNoVec, rowCount, spuNoBytes);
+            preallocateVarCharVector(skuNoVec, rowCount, skuNoBytes);
+            preallocateVarCharVector(goodsNameVec, rowCount, goodsNameBytes);
+            preallocateVarCharVector(category1Vec, rowCount, category1Bytes);
+            preallocateVarCharVector(category2Vec, rowCount, category2Bytes);
+            preallocateVarCharVector(brandNameVec, rowCount, brandNameBytes);
+            preallocateVarCharVector(specVec, rowCount, specBytes);
+
             // 填充数据
             for (int i = 0; i < items.size(); i++) {
                 EcommerceOrderItem item = items.get(i);
                 
                 itemIdVec.set(i, item.itemId());
                 orderIdVec.set(i, item.orderId());
-                spuNoVec.set(i, item.spuNo().getBytes(StandardCharsets.UTF_8));
-                skuNoVec.set(i, item.skuNo().getBytes(StandardCharsets.UTF_8));
-                goodsNameVec.set(i, item.goodsName().getBytes(StandardCharsets.UTF_8));
-                category1Vec.set(i, item.category1().getBytes(StandardCharsets.UTF_8));
-                category2Vec.set(i, item.category2().getBytes(StandardCharsets.UTF_8));
-                brandNameVec.set(i, item.brandName().getBytes(StandardCharsets.UTF_8));
+                safeSetVariableWidthField(spuNoVec, i, item.spuNo());
+                safeSetVariableWidthField(skuNoVec, i, item.skuNo());
+                safeSetVariableWidthField(goodsNameVec, i, item.goodsName());
+                safeSetVariableWidthField(category1Vec, i, item.category1());
+                safeSetVariableWidthField(category2Vec, i, item.category2());
+                safeSetVariableWidthField(brandNameVec, i, item.brandName());
                 originalPriceVec.set(i, item.originalPrice());
                 salePriceVec.set(i, item.salePrice());
                 buyNumVec.set(i, item.buyNum());
                 subtotalVec.set(i, item.itemSubtotal());
-                specVec.set(i, item.goodsSpec().getBytes(StandardCharsets.UTF_8));
+                safeSetVariableWidthField(specVec, i, item.goodsSpec());
             }
             
             root.setRowCount(items.size());
@@ -388,6 +500,33 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         }
         
         StatsCollector.getInstance().recordTableWrite("order_item", items.size(), System.nanoTime() - writeStart);
+    }
+
+    private void preallocateVarCharVector(VarCharVector vector, int valueCount, int dataBytes) {
+        int initialBytes = Math.max(ARROW_INITIAL_CAPACITY, dataBytes);
+        vector.allocateNew(initialBytes, valueCount);
+    }
+
+    private int estimateUtf8Bytes(String value) {
+        if (value == null) {
+            return 0;
+        }
+        return value.length() * 4;
+    }
+
+    private void safeSetVariableWidthField(BaseVariableWidthVector vector, int index, String value) {
+        if (value == null) {
+            vector.setNull(index);
+            return;
+        }
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        int dataLength = bytes.length;
+        ArrowBuf dataBuf = vector.getDataBuffer();
+        while (dataBuf.writerIndex() + dataLength > dataBuf.capacity()) {
+            vector.reallocDataBuffer();
+            dataBuf = vector.getDataBuffer();
+        }
+        vector.set(index, bytes, 0, dataLength);
     }
 
     /**
@@ -467,22 +606,87 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
      */
     private void registerAndInsertArrowTable(VectorSchemaRoot root, String tempTableName, String targetTableName) throws SQLException {
         try (Statement stmt = connection.createStatement()) {
-            // 先删除临时表（如果存在）
+            // 先删除临时视图/表（如果存在）
+            stmt.execute("DROP VIEW IF EXISTS " + tempTableName);
             stmt.execute("DROP TABLE IF EXISTS " + tempTableName);
-            
-            // 尝试真正的零拷贝注册
-            boolean registered = tryRegisterArrowZeroCopy(connection, root, tempTableName, allocator);
-            
-            if (registered) {
-                // 零拷贝插入成功：INSERT INTO target SELECT * FROM arrow_temp
-                // 这一步DuckDB直接从Arrow内存读取数据，无需序列化/反序列化
-                stmt.execute("INSERT OR REPLACE INTO " + targetTableName + " SELECT * FROM " + tempTableName);
-                
-                // 清理临时表
-                stmt.execute("DROP TABLE IF EXISTS " + tempTableName);
-            } else {
-                // 备选方案：使用Appender API进行高效批量写入
-                writeWithAppender(root, targetTableName);
+
+            // 尝试真正的零拷贝注册，并保持stream生命周期覆盖INSERT语句
+            try (ArrowStreamRegistration registration = registerArrowStream(root, tempTableName, allocator)) {
+                if (registration != null) {
+                    // 零拷贝插入成功：INSERT INTO target SELECT * FROM arrow_temp
+                    // 这一步DuckDB直接从Arrow内存读取数据，无需序列化/反序列化
+                    stmt.execute("INSERT OR REPLACE INTO " + targetTableName + " SELECT * FROM " + tempTableName);
+
+                    // 清理临时视图/表
+                    stmt.execute("DROP VIEW IF EXISTS " + tempTableName);
+                    stmt.execute("DROP TABLE IF EXISTS " + tempTableName);
+                    return;
+                }
+            }
+
+            // 备选方案：使用Appender API进行高效批量写入
+//            writeWithAppender(root, targetTableName);
+        }
+    }
+
+    private ArrowStreamRegistration registerArrowStream(VectorSchemaRoot root, String tableName, BufferAllocator allocator) {
+        if (!(connection instanceof DuckDBConnection)) {
+            System.out.println("警告: 连接不是DuckDBConnection类型，无法使用Arrow零拷贝");
+            return null;
+        }
+
+        DuckDBConnection duckDBConn = (DuckDBConnection) connection;
+        ArrowArrayStream arrowStream = null;
+        ArrowReader reader = null;
+
+        try {
+            arrowStream = ArrowArrayStream.allocateNew(allocator);
+            reader = createVectorSchemaRootReader(root, allocator);
+            Data.exportArrayStream(allocator, reader, arrowStream);
+            duckDBConn.registerArrowStream(tableName, arrowStream);
+            return new ArrowStreamRegistration(arrowStream, reader);
+        } catch (Exception e) {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (Exception ignored) {
+                    throw new RuntimeException("Failed to close Arrow reader after registration failure", e);
+                }
+            }
+            if (arrowStream != null) {
+                try {
+                    arrowStream.close();
+                } catch (Exception ignored) {
+                    throw new RuntimeException("Failed to close Arrow stream after registration failure", e);
+                }
+            }
+            System.out.println("Arrow零拷贝注册失败: " + e.getMessage() +
+                    ", 将使用备选方案。原因: " +
+                    (e.getCause() != null ? e.getCause().getMessage() : "unknown"));
+            return null;
+        }
+    }
+
+    private static final class ArrowStreamRegistration implements AutoCloseable {
+        private final ArrowArrayStream arrowStream;
+        private final ArrowReader reader;
+
+        private ArrowStreamRegistration(ArrowArrayStream arrowStream, ArrowReader reader) {
+            this.arrowStream = arrowStream;
+            this.reader = reader;
+        }
+
+        @Override
+        public void close() {
+            try {
+                reader.close();
+            } catch (Exception ignored) {
+                // ignore
+            }
+            try {
+                arrowStream.close();
+            } catch (Exception ignored) {
+                // ignore
             }
         }
     }
@@ -504,25 +708,25 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         }
         
         DuckDBConnection duckDBConn = (DuckDBConnection) conn;
-        
+
         // 创建ArrowArrayStream用于零拷贝传输
         try (ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
-            
+
             // 创建ArrowReader包装VectorSchemaRoot
             try (ArrowReader reader = createVectorSchemaRootReader(root, allocator)) {
-                
+
                 // 导出为C Data Interface格式（真正的零拷贝！）
                 // Data.exportArrayStream会将Arrow数据以零拷贝方式暴露给C层
                 Data.exportArrayStream(allocator, reader, arrowStream);
-                
+
                 // 注册到DuckDB - 这一步DuckDB会直接读取Arrow内存
                 // 无需数据复制，无需序列化/反序列化
                 duckDBConn.registerArrowStream(tableName, arrowStream);
-                
+
                 return true;
             }
         } catch (Exception e) {
-            System.out.println("Arrow零拷贝注册失败: " + e.getMessage() + 
+            System.out.println("Arrow零拷贝注册失败: " + e.getMessage() +
                              ", 将使用备选方案。原因: " + 
                              (e.getCause() != null ? e.getCause().getMessage() : "unknown"));
             return false;
@@ -804,15 +1008,17 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
      */
     @Override
     public List<Map<String, Object>> flush() throws SQLException {
-        if (batchBuffer.isEmpty()) {
-            return Collections.emptyList();
+        synchronized (lock) {
+            if (batchBuffer.isEmpty()) {
+                return Collections.emptyList();
+            }
+            
+            List<EcommerceOrderBatch> batches = new ArrayList<>(batchBuffer);
+            batchBuffer.clear();
+            lastFlushTime.set(System.currentTimeMillis());
+            
+            return processBatchInternal(batches);
         }
-        
-        List<EcommerceOrderBatch> batches = new ArrayList<>(batchBuffer);
-        batchBuffer.clear();
-        lastFlushTime.set(System.currentTimeMillis());
-        
-        return processBatchInternal(batches);
     }
 
     /**
@@ -837,7 +1043,7 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 } catch (SQLException ignored) {}
             }
             
-            // 关闭Arrow内存分配器
+            // 关闭Arrow 内存分配器
             if (allocator != null) {
                 allocator.close();
             }

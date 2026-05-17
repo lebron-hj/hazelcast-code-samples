@@ -317,6 +317,11 @@ public final class StatsCollector {
      * 用于在数据处理流程中打印DuckDB写入和JOIN查询性能指标
      */
     public void printStats() {
+
+        if (PerfConfig.ROLLING_STATS_ENABLED) {
+            return;
+        }
+
         long batches = totalBatches.get();
         long rows = totalRows.get();
         long nanos = totalNanos.get();
@@ -346,8 +351,8 @@ public final class StatsCollector {
         // 计算延迟百分位
         double[] percentiles = calculateLatencyPercentiles();
         
-        System.out.printf("[DUCKDB] QPS: %.1f | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms (P50: %.2fms P99: %.2fms) | JOIN-QPS: %.1f | 表写入: buyer=%d(%.1fTPS) order=%d(%.1fTPS) item=%d(%.1fTPS)%n",
-                qps, batches, rows, avgLatencyMs, percentiles[1], percentiles[4], joinQps, 
+        System.out.printf("[DUCKDB] QPS: %.1f | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms (P50: %.2fms P99: %.2fms) | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %.1f | 表写入: buyer=%d(%.1fTPS) order=%d(%.1fTPS) item=%d(%.1fTPS)%n",
+                qps, batches, rows, avgLatencyMs, percentiles[1], percentiles[4], joinSeconds, joinRowCount, joinQps,
                 buyerRows, buyerTps, orderRows, orderTps, itemRows, itemTps);
     }
 
