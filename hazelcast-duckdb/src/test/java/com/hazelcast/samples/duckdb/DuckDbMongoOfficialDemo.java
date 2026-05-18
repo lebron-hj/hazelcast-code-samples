@@ -24,7 +24,7 @@ import java.sql.Statement;
 public class DuckDbMongoOfficialDemo {
     public static void main(String[] args) {
         // 官方推荐连接参数：设置内存限制，避免 OOM
-        String duckDbUrl = "jdbc:duckdb:memory?memory_limit=8GB&threads=4";
+        String duckDbUrl = "jdbc:duckdb:memory:";
 
         try (Connection conn = DriverManager.getConnection(duckDbUrl);
              Statement stmt = conn.createStatement()) {
