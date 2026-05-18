@@ -418,7 +418,7 @@ public final class StatsCollector {
             double avgLatency300 = calculateAvgLatencyForWindow(WINDOW_5_MIN);
             double avgLatency600 = calculateAvgLatencyForWindow(WINDOW_10_MIN);
             
-            System.out.printf("  ├─ %-18s %.2f/%.2f/%.2f/%.2f ms\n", "平均延迟[30s/1m/5m/10m]:", avgLatency30, avgLatency60, avgLatency300, avgLatency600);
+            System.out.printf("  ├─ %-18s %.2f/%.2f/%.2f/%.2f ms\n", "窗口处理时间[30s/1m/5m/10m]:", avgLatency30, avgLatency60, avgLatency300, avgLatency600);
             
             if (hasLatestJoin) {
                 System.out.printf("  ├─ %-18s %,d 行, %.3f ms\n", "最后 JOIN 查询:", latestJoinRows, latestJoinNanos / 1_000_000.0);
@@ -602,7 +602,7 @@ public final class StatsCollector {
                 }
                 
                 // 窗口内平均延迟（显示4个时间窗口）
-                sb.append(String.format("| 平均延迟[30s/1m/5m/10m]: %.2f/%.2f/%.2f/%.2fms", 
+                sb.append(String.format("| 窗口处理时间[30s/1m/5m/10m]: %.2f/%.2f/%.2f/%.2fms", 
                         avgLatency30Sec, avgLatency1Min, avgLatency5Min, avgLatency10Min));
                 
                 System.out.print(sb);
@@ -744,7 +744,7 @@ public final class StatsCollector {
     }
     
     /**
-     * 计算指定时间窗口的平均延迟
+     * 计算指定时间窗口的总延迟
      */
     private double calculateAvgLatencyForWindow(int windowSize) {
         if (totalSamples == 0) {
@@ -760,7 +760,7 @@ public final class StatsCollector {
             int idx = (sampleIndex - 1 - i + MAX_SAMPLES) % MAX_SAMPLES;
             if (sampleTimestamps[idx] > 0) {
                 totalNanosInWindow += deltaTotalNanos[idx];
-                totalBatchesInWindow += deltaBatchCount[idx];
+                totalBatchesInWindow += 1;
             }
         }
         
