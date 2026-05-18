@@ -95,7 +95,7 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         this.allocator = new RootAllocator();
         
         // 建立DuckDB连接
-        this.connection = DriverManager.getConnection(PerfConfig.DUCKDB_JDBC_URL);
+        this.connection = PerfConfig.openDuckDbConnection();
         this.connection.setAutoCommit(false);
         
         // 初始化表结构

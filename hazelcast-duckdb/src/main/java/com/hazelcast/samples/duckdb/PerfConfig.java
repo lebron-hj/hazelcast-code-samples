@@ -15,6 +15,11 @@
  */
 package com.hazelcast.samples.duckdb;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.util.Properties;
+
 public final class PerfConfig {
 
     private PerfConfig() {
@@ -28,6 +33,13 @@ public final class PerfConfig {
      * 默认配置：内存模式，4GB内存限制，8线程，关闭WAL自动检查点，启用对象缓存
      */
     public static final String DUCKDB_JDBC_URL;
+
+    public static final String DUCKDB_TEMP_DIRECTORY;
+    public static final String DUCKDB_PRESERVE_INSERTION_ORDER;
+    public static final String DUCKDB_MEMORY_LIMIT;
+    public static final String DUCKDB_THREADS;
+    public static final String DUCKDB_CHECKPOINT_THRESHOLD;
+    public static final String DUCKDB_ENABLE_OBJECT_CACHE;
 
     /**
      * 连接池大小（用于共享连接模式）
@@ -172,18 +184,19 @@ public final class PerfConfig {
     static {
         // DuckDB JDBC URL
         String jdbcUrl = System.getProperty("duckdb.jdbc.url");
+        int cpuCores = Runtime.getRuntime().availableProcessors();
         if (jdbcUrl == null || jdbcUrl.isBlank()) {
-            // 优化后的默认配置：
-            // - 8GB内存限制
-            // - 线程数等于CPU核心数
-            // - 禁用WAL（大幅提升写入性能）
-            // - 禁用检查点
-            // - 启用对象缓存
-            int cpuCores = Runtime.getRuntime().availableProcessors();
-            jdbcUrl = String.format("jdbc:duckdb:memory:?memory_limit=1GB&threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
-//            jdbcUrl = String.format("jdbc:duckdb:memory:?threads=%d&wal_enabled=false&checkpoint_threshold=0&enable_object_cache=true", cpuCores);
+            // 内存数据库使用简洁URL，参数通过duckdb.*属性传入
+            jdbcUrl = "jdbc:duckdb:";
         }
         DUCKDB_JDBC_URL = jdbcUrl;
+
+        DUCKDB_TEMP_DIRECTORY = System.getProperty("duckdb.temp_directory", "/Users/hj/duckdb");
+        DUCKDB_PRESERVE_INSERTION_ORDER = System.getProperty("duckdb.preserve_insertion_order", "false");
+        DUCKDB_MEMORY_LIMIT = System.getProperty("duckdb.memory_limit", "1GB");
+        DUCKDB_THREADS = System.getProperty("duckdb.threads", String.valueOf(cpuCores));
+        DUCKDB_CHECKPOINT_THRESHOLD = System.getProperty("duckdb.checkpoint_threshold", "1GB");
+        DUCKDB_ENABLE_OBJECT_CACHE = System.getProperty("duckdb.enable_object_cache", "true");
 
         // 连接池配置
         CONNECTION_POOL_SIZE = Integer.getInteger("duckdb.connection.pool-size", 4);
@@ -232,6 +245,24 @@ public final class PerfConfig {
         RESULT_LIST_NAME = System.getProperty("duckdb.list.result-name", "ecommerce-output");
     }
 
+    public static Connection openDuckDbConnection() throws SQLException {
+        Properties props = new Properties();
+        setIfPresent(props, "temp_directory", DUCKDB_TEMP_DIRECTORY);
+        setIfPresent(props, "preserve_insertion_order", DUCKDB_PRESERVE_INSERTION_ORDER);
+        setIfPresent(props, "memory_limit", DUCKDB_MEMORY_LIMIT);
+        setIfPresent(props, "threads", DUCKDB_THREADS);
+        setIfPresent(props, "checkpoint_threshold", DUCKDB_CHECKPOINT_THRESHOLD);
+        setIfPresent(props, "enable_object_cache", DUCKDB_ENABLE_OBJECT_CACHE);
+        return DriverManager.getConnection(DUCKDB_JDBC_URL, props);
+    }
+
+    private static void setIfPresent(Properties props, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        props.setProperty(key, value);
+    }
+
     /**
      * 获取当前配置摘要，用于日志输出
      */
@@ -239,6 +270,12 @@ public final class PerfConfig {
         StringBuilder sb = new StringBuilder();
         sb.append("\n=== DuckDB 性能配置摘要 ===\n");
         sb.append("JDBC URL: ").append(DUCKDB_JDBC_URL).append("\n");
+        sb.append("duckdb.temp_directory: ").append(DUCKDB_TEMP_DIRECTORY).append("\n");
+        sb.append("duckdb.preserve_insertion_order: ").append(DUCKDB_PRESERVE_INSERTION_ORDER).append("\n");
+        sb.append("duckdb.memory_limit: ").append(DUCKDB_MEMORY_LIMIT).append("\n");
+        sb.append("duckdb.threads: ").append(DUCKDB_THREADS).append("\n");
+        sb.append("duckdb.checkpoint_threshold: ").append(DUCKDB_CHECKPOINT_THRESHOLD).append("\n");
+        sb.append("duckdb.enable_object_cache: ").append(DUCKDB_ENABLE_OBJECT_CACHE).append("\n");
         sb.append("连接池大小: ").append(CONNECTION_POOL_SIZE).append("\n");
         sb.append("批次数: ").append(DEFAULT_BATCH_COUNT).append("\n");
         sb.append("每订单项数范围: ").append(ITEMS_PER_ORDER_MIN).append("-").append(ITEMS_PER_ORDER_MAX).append("\n");
