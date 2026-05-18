@@ -362,9 +362,42 @@ public final class StatsCollector {
      * 打印实时统计（支持多时间窗口）
      */
     public void printStats() {
-        if (!rollingEnabled) {
+        if (rollingEnabled) {
             return;
         }
+
+        long batches = totalBatches.get();
+        long rows = totalRows.get();
+        long nanos = totalNanos.get();
+        double seconds = nanos / 1_000_000_000.0;
+        double qps = seconds > 0.0 ? rows / seconds : 0.0;
+        double avgLatencyMs = batches > 0 ? (nanos / 1_000_000.0) / batches : 0.0;
+
+        // JOIN统计
+        long joinRowCount = joinRows.get();
+        long joinNanosValue = joinNanos.get();
+        double joinSeconds = joinNanosValue / 1_000_000_000.0;
+        double joinQps = joinSeconds > 0.0 ? joinRowCount / joinSeconds : 0.0;
+
+        // 各表写入统计（包含TPS）
+        long buyerRows = tableRows.getOrDefault("buyer_info", new AtomicLong()).get();
+        long buyerNanos = tableNanos.getOrDefault("buyer_info", new AtomicLong()).get();
+        double buyerTps = buyerNanos > 0 ? buyerRows / (buyerNanos / 1_000_000_000.0) : 0.0;
+
+        long orderRows = tableRows.getOrDefault("order_main", new AtomicLong()).get();
+        long orderNanos = tableNanos.getOrDefault("order_main", new AtomicLong()).get();
+        double orderTps = orderNanos > 0 ? orderRows / (orderNanos / 1_000_000_000.0) : 0.0;
+
+        long itemRows = tableRows.getOrDefault("order_item", new AtomicLong()).get();
+        long itemNanos = tableNanos.getOrDefault("order_item", new AtomicLong()).get();
+        double itemTps = itemNanos > 0 ? itemRows / (itemNanos / 1_000_000_000.0) : 0.0;
+
+        // 计算延迟百分位
+        double[] percentiles = calculateLatencyPercentiles();
+
+        System.out.printf("[DUCKDB] QPS: %.1f | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms (P50: %.2fms P99: %.2fms) | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %.1f | 表写入: buyer=%d(%.1fTPS) order=%d(%.1fTPS) item=%d(%.1fTPS)%n",
+                qps, batches, rows, avgLatencyMs, percentiles[1], percentiles[4], joinSeconds, joinRowCount, joinQps,
+                buyerRows, buyerTps, orderRows, orderTps, itemRows, itemTps);
     }
 
     /**
