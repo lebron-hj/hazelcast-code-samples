@@ -317,8 +317,12 @@ public class CopyModeDuckDbOperator implements DuckDbOperator {
         
         // 记录统计
         long durationNanos = System.nanoTime() - startNanos;
-        int totalRows = batches.size() * 4; // 估算：1 buyer + 1 order + 2-5 items
-        StatsCollector.getInstance().recordBatch(batches.size(), totalRows, durationNanos);
+        long entityCount = batches.stream()
+                .mapToLong(batch -> (batch.buyer() == null ? 0 : 1)
+                        + (batch.order() == null ? 0 : 1)
+                        + (batch.items() == null ? 0 : batch.items().size()))
+                .sum();
+        StatsCollector.getInstance().recordBatch(batches.size(), entityCount, durationNanos);
         StatsCollector.getInstance().recordJoin(joinCount, System.nanoTime() - startNanos);
 
         // 打印DuckDB性能统计

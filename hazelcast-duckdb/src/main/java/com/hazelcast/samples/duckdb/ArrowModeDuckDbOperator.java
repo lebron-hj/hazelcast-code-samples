@@ -36,6 +36,17 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.duckdb.DuckDBConnection;
 
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.ReplaceOneModel;
+import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.WriteModel;
+import org.bson.Document;
+
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -86,20 +97,38 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
     // 锁对象，防止多个线程同时访问 operator
     private final Object lock = new Object();
 
+    private final boolean mongoExternalEnabled = PerfConfig.MONGO_EXTERNAL_ENABLED;
+    private MongoClient mongoClient;
+
     public ArrowModeDuckDbOperator() throws SQLException {
         this.batchWritingEnabled = PerfConfig.BATCH_WRITING_ENABLED;
         this.batchWritingSize = PerfConfig.BATCH_WRITING_SIZE;
         this.batchWritingTimeoutMs = PerfConfig.BATCH_WRITING_TIMEOUT_MS;
-        
+
         // 创建Arrow内存分配器
         this.allocator = new RootAllocator();
-        
+
         // 建立DuckDB连接
         this.connection = PerfConfig.openDuckDbConnection();
         this.connection.setAutoCommit(false);
-        
-        // 初始化表结构
-        initTables();
+
+        if (mongoExternalEnabled) {
+            initMongoExternalTables();
+        } else {
+            // 初始化表结构
+            initTables();
+        }
+    }
+
+    private void initMongoExternalTables() throws SQLException {
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("INSTALL mongo FROM 'http://community-extensions.duckdb.org';");
+            stmt.execute("LOAD mongo;");
+            String attachSql = String.format("ATTACH '%s' AS %s (TYPE MONGO);",
+                    PerfConfig.MONGO_URI,
+                    PerfConfig.MONGO_SCHEMA);
+            stmt.execute(attachSql);
+        }
     }
 
     private void initTables() throws SQLException {
@@ -226,15 +255,25 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 List<EcommerceOrderItem> items = new ArrayList<>(itemMap.values());
                 
                 // 使用Arrow VectorSchemaRoot写入
-                writeBuyersWithArrow(buyers);
-                writeOrdersWithArrow(orders);
-                writeOrderItemsWithArrow(items);
-                
+                if (mongoExternalEnabled) {
+                    writeBuyersWithMongo(buyers);
+                    writeOrdersWithMongo(orders);
+                    writeOrderItemsWithMongo(items);
+                } else {
+                    writeBuyersWithArrow(buyers);
+                    writeOrdersWithArrow(orders);
+                    writeOrderItemsWithArrow(items);
+                }
+
                 connection.commit();
                 
                 // 更新统计
-                StatsCollector.getInstance().recordBatch(batches.size(), 
-                        batches.stream().mapToLong(b -> b.items().size() + 2).sum(), 
+                long entityCount = batches.stream()
+                        .mapToLong(batch -> (batch.buyer() == null ? 0 : 1)
+                                + (batch.order() == null ? 0 : 1)
+                                + (batch.items() == null ? 0 : batch.items().size()))
+                        .sum();
+                StatsCollector.getInstance().recordBatch(batches.size(), entityCount,
                         System.nanoTime() - startTime);
 
                 // 执行宽表查询（批量查询）
@@ -256,6 +295,102 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 throw new RuntimeException("Failed to write batches", e);
             }
         }
+    }
+
+    private MongoDatabase getMongoDatabase() {
+        if (mongoClient == null) {
+            mongoClient = MongoClients.create(PerfConfig.MONGO_URI);
+        }
+        return mongoClient.getDatabase(PerfConfig.MONGO_DATABASE);
+    }
+
+    private MongoCollection<Document> getMongoCollection(String collectionName) {
+        return getMongoDatabase().getCollection(collectionName);
+    }
+
+    private void writeBuyersWithMongo(List<EcommerceBuyer> buyers) {
+        if (buyers.isEmpty()) {
+            return;
+        }
+        MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_BUYER_COLLECTION);
+        List<WriteModel<Document>> writes = new ArrayList<>(buyers.size());
+        ReplaceOptions options = new ReplaceOptions().upsert(true);
+        for (EcommerceBuyer buyer : buyers) {
+            Document doc = new Document("buyer_id", buyer.buyerId())
+                    .append("buyer_nickname", buyer.buyerNickname())
+                    .append("buyer_real_name", buyer.buyerRealName())
+                    .append("buyer_phone", buyer.buyerPhone())
+                    .append("buyer_level", buyer.buyerLevel())
+                    .append("register_area", buyer.registerArea())
+                    .append("register_time", buyer.registerTime());
+            writes.add(new ReplaceOneModel<>(Filters.eq("buyer_id", buyer.buyerId()), doc, options));
+        }
+        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+    }
+
+    private void writeOrdersWithMongo(List<EcommerceOrder> orders) {
+        if (orders.isEmpty()) {
+            return;
+        }
+        MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_ORDER_COLLECTION);
+        List<WriteModel<Document>> writes = new ArrayList<>(orders.size());
+        ReplaceOptions options = new ReplaceOptions().upsert(true);
+        for (EcommerceOrder order : orders) {
+            Document doc = new Document("order_id", order.orderId())
+                    .append("order_no", order.orderNo())
+                    .append("buyer_id", order.buyerId())
+                    .append("order_status", order.orderStatus())
+                    .append("pay_status", order.payWay())
+                    .append("order_amount", order.totalAmount())
+                    .append("pay_amount", order.payAmount())
+                    .append("freight_amount", order.freightAmount())
+                    .append("discount_amount", order.couponAmount())
+                    .append("create_time", order.createTime())
+                    .append("pay_time", order.payTime());
+            writes.add(new ReplaceOneModel<>(Filters.eq("order_id", order.orderId()), doc, options));
+        }
+        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+    }
+
+    private void writeOrderItemsWithMongo(List<EcommerceOrderItem> items) {
+        if (items.isEmpty()) {
+            return;
+        }
+        MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_ITEM_COLLECTION);
+        List<WriteModel<Document>> writes = new ArrayList<>(items.size());
+        ReplaceOptions options = new ReplaceOptions().upsert(true);
+        for (EcommerceOrderItem item : items) {
+            Document doc = new Document("item_id", item.itemId())
+                    .append("order_id", item.orderId())
+                    .append("spu_no", item.spuNo())
+                    .append("sku_no", item.skuNo())
+                    .append("goods_name", item.goodsName())
+                    .append("category1", item.category1())
+                    .append("category2", item.category2())
+                    .append("brand_name", item.brandName())
+                    .append("original_price", item.originalPrice())
+                    .append("sale_price", item.salePrice())
+                    .append("buy_num", item.buyNum())
+                    .append("item_subtotal", item.itemSubtotal())
+                    .append("goods_spec", item.goodsSpec());
+            writes.add(new ReplaceOneModel<>(Filters.eq("item_id", item.itemId()), doc, options));
+        }
+        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+    }
+
+    private String tableRef(String logicalTable) {
+        if (!mongoExternalEnabled) {
+            return logicalTable;
+        }
+        String collectionName = logicalTable;
+        if ("buyer_info".equals(logicalTable)) {
+            collectionName = PerfConfig.MONGO_BUYER_COLLECTION;
+        } else if ("order_main".equals(logicalTable)) {
+            collectionName = PerfConfig.MONGO_ORDER_COLLECTION;
+        } else if ("order_item".equals(logicalTable)) {
+            collectionName = PerfConfig.MONGO_ITEM_COLLECTION;
+        }
+        return PerfConfig.MONGO_SCHEMA + ".\"" + PerfConfig.MONGO_DATABASE + "\"." + collectionName;
     }
 
     /**
@@ -916,6 +1051,9 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         }
         
         StringBuilder sqlBuilder = new StringBuilder();
+        String buyerInfo = tableRef("buyer_info");
+        String orderMain = tableRef("order_main");
+        String orderItem = tableRef("order_item");
         sqlBuilder.append("SELECT\n");
         sqlBuilder.append("    bi.buyer_id,\n");
         sqlBuilder.append("    bi.buyer_nickname,\n");
@@ -946,9 +1084,9 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         sqlBuilder.append("    oi.buy_num,\n");
         sqlBuilder.append("    oi.item_subtotal,\n");
         sqlBuilder.append("    oi.goods_spec\n");
-        sqlBuilder.append("FROM order_main om\n");
-        sqlBuilder.append("LEFT JOIN buyer_info bi ON om.buyer_id = bi.buyer_id\n");
-        sqlBuilder.append("LEFT JOIN order_item oi ON om.order_id = oi.order_id\n");
+        sqlBuilder.append("FROM ").append(orderMain).append(" om\n");
+        sqlBuilder.append("LEFT JOIN ").append(buyerInfo).append(" bi ON om.buyer_id = bi.buyer_id\n");
+        sqlBuilder.append("LEFT JOIN ").append(orderItem).append(" oi ON om.order_id = oi.order_id\n");
         sqlBuilder.append("WHERE om.order_id IN (");
         for (int i = 0; i < orderIds.size(); i++) {
             if (i > 0) {
@@ -969,7 +1107,8 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 row.put("buyer_phone", rs.getString("buyer_phone"));
                 row.put("buyer_level", rs.getString("buyer_level"));
                 row.put("register_area", rs.getString("register_area"));
-                row.put("register_time", rs.getTimestamp("register_time"));
+                row.put("register_time", mongoExternalEnabled ? getTimestampValue(rs, "register_time")
+                        : rs.getTimestamp("register_time"));
                 row.put("order_id", rs.getLong("order_id"));
                 row.put("order_no", rs.getString("order_no"));
                 row.put("order_status", rs.getString("order_status"));
@@ -978,8 +1117,10 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 row.put("pay_amount", rs.getDouble("pay_amount"));
                 row.put("freight_amount", rs.getDouble("freight_amount"));
                 row.put("discount_amount", rs.getDouble("discount_amount"));
-                row.put("create_time", rs.getTimestamp("create_time"));
-                row.put("pay_time", rs.getTimestamp("pay_time"));
+                row.put("create_time", mongoExternalEnabled ? getTimestampValue(rs, "create_time")
+                        : rs.getTimestamp("create_time"));
+                row.put("pay_time", mongoExternalEnabled ? getTimestampValue(rs, "pay_time")
+                        : rs.getTimestamp("pay_time"));
                 row.put("item_id", rs.getLong("item_id"));
                 row.put("spu_no", rs.getString("spu_no"));
                 row.put("sku_no", rs.getString("sku_no"));
@@ -997,6 +1138,28 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         }
         
         return rows;
+    }
+
+    private java.sql.Timestamp getTimestampValue(ResultSet rs, String column) throws SQLException {
+        Object value = rs.getObject(column);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof java.sql.Timestamp) {
+            return (java.sql.Timestamp) value;
+        }
+        if (value instanceof Number) {
+            return new java.sql.Timestamp(((Number) value).longValue());
+        }
+        if (value instanceof java.util.Date) {
+            return new java.sql.Timestamp(((java.util.Date) value).getTime());
+        }
+        String text = value.toString();
+        try {
+            return java.sql.Timestamp.valueOf(text);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
     }
 
     /**
@@ -1042,6 +1205,9 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
             // 关闭Arrow 内存分配器
             if (allocator != null) {
                 allocator.close();
+            }
+            if (mongoClient != null) {
+                mongoClient.close();
             }
         }
     }

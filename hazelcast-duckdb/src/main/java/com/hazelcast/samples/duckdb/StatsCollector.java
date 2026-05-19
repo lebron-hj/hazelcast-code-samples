@@ -306,7 +306,7 @@ public final class StatsCollector {
         System.out.printf("  %-20s %,d%n", "总批次数:", batches);
         System.out.printf("  %-20s %,d%n", "总输出行数:", rows);
         System.out.printf("  %-20s %.3f 秒%n", "总耗时:", seconds);
-        System.out.printf("  %-20s %s万 (行/秒)%n", "QPS:", formatQpsTps(qps));
+        System.out.printf("  %-20s %s (行/秒)%n", "QPS:", formatQpsTps(qps));
         System.out.printf("  %-20s %.2f 批/秒%n", "批次吞吐:", batchesPerSecond);
         
         // 延迟统计
@@ -339,7 +339,7 @@ public final class StatsCollector {
                 
                 System.out.printf("  ├─ %s:%n", table);
                 System.out.printf("  │   %-16s %,d%n", "行数:", tableRowCount);
-                System.out.printf("  │   %-16s %s万%n", "QPS:", formatQpsTps(tableQps));
+                System.out.printf("  │   %-16s %s%n", "QPS:", formatQpsTps(tableQps));
                 System.out.printf("  │   %-16s %.4f 毫秒%n", "平均每行延迟:", avgRowMs);
                 System.out.printf("  │   %-16s %,d (%.4f%%)%n", "重试次数:", tableRetryCount, tableRetryRate);
             }
@@ -353,7 +353,7 @@ public final class StatsCollector {
         
         System.out.println("\n【宽表查询 (Join) 统计】");
         System.out.printf("  %-20s %,d%n", "返回行数:", joinRowCount);
-        System.out.printf("  %-20s %s万%n", "QPS:", formatQpsTps(joinQps));
+        System.out.printf("  %-20s %s%n", "QPS:", formatQpsTps(joinQps));
         System.out.printf("  %-20s %.3f 秒%n", "总耗时:", joinSeconds);
         
         System.out.println("\n" + "=".repeat(70));
@@ -363,22 +363,23 @@ public final class StatsCollector {
      * 打印完整统计报告（支持滚动统计和普通统计）
      */
     /**
-     * 格式化 QPS/TPS 为万单位，便于查看
+     * 格式化 QPS/TPS，低于 1 万时直接显示数值，否则以万为单位显示
      * @param value QPS/TPS 值
-     * @return 格式化后的字符串（例如 "2.4" 表示 2.4万）
+     * @return 格式化后的字符串（例如 "950.00" 或 "1.2万"）
      */
     private String formatQpsTps(double value) {
-        if (value < 1000.0) {
-            return String.format("%.2f", value / 10000.0);
-        } else if (value < 10000.0) {
-            return String.format("%.1f", value / 10000.0);
-        } else {
-            return String.format("%.0f", value / 10000.0);
+        if (value < 10000.0) {
+            return String.format("%.2f", value);
         }
+        double wan = value / 10000.0;
+        if (value < 100000.0) {
+            return String.format("%.1f万", wan);
+        }
+        return String.format("%.0f万", wan);
     }
     
     /**
-     * 格式化 Map 中的 QPS/TPS 为万单位
+     * 格式化 Map 中的 QPS/TPS（低于 1 万直接显示数值）
      * @param map 包含表名和对应 TPS 的 Map
      * @return 包含表名和格式化后 TPS 的新 Map
      */
@@ -399,8 +400,8 @@ public final class StatsCollector {
         System.out.println("\n========== 完整统计报告 ==========");
         System.out.printf("%-20s %,d\n", "总行数:", currentTotalRows);
         System.out.printf("%-20s %.2f s\n", "总耗时:", totalSeconds);
-        System.out.printf("%-20s %s万\n", "平均 QPS:", formatQpsTps(avgQps));
-        
+        System.out.printf("%-20s %s%n", "平均 QPS:", formatQpsTps(avgQps));
+
         // 如果启用了滚动统计，显示多时间窗口统计
         if (rollingEnabled && totalSamples > 0) {
             System.out.println("\n【滚动时间窗口统计】");
@@ -410,7 +411,7 @@ public final class StatsCollector {
             double qps300 = calculateQpsForWindow(WINDOW_5_MIN);
             double qps600 = calculateQpsForWindow(WINDOW_10_MIN);
             
-            System.out.printf("  ├─ %-18s %s/%s/%s/%s万\n", "QPS[30s/1m/5m/10m]:", 
+            System.out.printf("  ├─ %-18s %s/%s/%s/%s%n", "QPS[30s/1m/5m/10m]:",
                     formatQpsTps(qps30), formatQpsTps(qps60), formatQpsTps(qps300), formatQpsTps(qps600));
             
             double avgLatency30 = calculateAvgLatencyForWindow(WINDOW_30_SEC);
@@ -436,7 +437,7 @@ public final class StatsCollector {
                     double t60 = tps60.getOrDefault(table, 0.0);
                     double t300 = tps300.getOrDefault(table, 0.0);
                     double t600 = tps600.getOrDefault(table, 0.0);
-                    System.out.printf("  ├─ %s TPS[30s/1m/5m/10m]: %s/%s/%s/%s万\n", 
+                    System.out.printf("  ├─ %s TPS[30s/1m/5m/10m]: %s/%s/%s/%s%n",
                             table, formatQpsTps(t30), formatQpsTps(t60), formatQpsTps(t300), formatQpsTps(t600));
                 }
             }
@@ -468,7 +469,7 @@ public final class StatsCollector {
             long itemNanos = tableNanos.getOrDefault("order_item", new AtomicLong()).get();
             double itemTps = itemNanos > 0 ? itemRows / (itemNanos / 1_000_000_000.0) : 0.0;
 
-            System.out.printf("%n[DUCKDB] QPS: %s万 | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %s万 | 表写入: buyer=%d(%s万TPS) order=%d(%s万TPS) item=%d(%s万TPS)%n",
+            System.out.printf("%n[DUCKDB] QPS: %s | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %s | 表写入: buyer=%d(%sTPS) order=%d(%sTPS) item=%d(%sTPS)%n",
                     formatQpsTps(qps), batches, rows, avgLatencyMs, joinSeconds, joinRowCount, formatQpsTps(joinQps),
                     buyerRows, formatQpsTps(buyerTps), orderRows, formatQpsTps(orderTps), itemRows, formatQpsTps(itemTps));
         }
@@ -488,7 +489,7 @@ public final class StatsCollector {
                 
                 System.out.printf("  ├─ %s:%n", table);
                 System.out.printf("  │   %-16s %,d\n", "行数:", tableRowCount);
-                System.out.printf("  │   %-16s %s万\n", "QPS:", formatQpsTps(tableQps));
+                System.out.printf("  │   %-16s %s%n", "QPS:", formatQpsTps(tableQps));
                 System.out.printf("  │   %-16s %.4f 毫秒\n", "平均每行延迟:", avgRowMs);
                 System.out.printf("  │   %-16s %,d (%.4f%%)\n", "重试次数:", tableRetryCount, tableRetryRate);
             }
@@ -572,13 +573,13 @@ public final class StatsCollector {
                 sb.append("[实时] ");
                 
                 // 最近1秒的行数
-                sb.append(String.format("%-18s", "实时QPS: " + formatQpsTps(deltaRows) + "万"));
-                
-                // 多时间窗口总体 QPS（万单位）
-                sb.append(String.format("| QPS[30s/1m/5m/10m]: %s/%s/%s/%s万 ",
+                sb.append(String.format("%-18s", "实时QPS: " + formatQpsTps(deltaRows)));
+
+                // 多时间窗口总体 QPS（自适应单位）
+                sb.append(String.format("| QPS[30s/1m/5m/10m]: %s/%s/%s/%s ",
                         formatQpsTps(qps30Sec), formatQpsTps(qps1Min), formatQpsTps(qps5Min), formatQpsTps(qps10Min)));
                 
-                // 各表 TPS（显示4个时间窗口，万单位）
+                // 各表 TPS（显示4个时间窗口，自适应单位）
                 if (tableStatsDetailed) {
                     sb.append("| ");
                     for (String table : new String[]{"buyer_info", "order_main", "order_item"}) {
@@ -587,7 +588,7 @@ public final class StatsCollector {
                         double tps300 = tableTps5Min.getOrDefault(table, 0.0);
                         double tps600 = tableTps10Min.getOrDefault(table, 0.0);
                         sb.append(table).append("[30s/1m/5m/10m]:").append(
-                                String.format("%s/%s/%s/%s万",
+                                String.format("%s/%s/%s/%s",
                                         formatQpsTps(tps30), formatQpsTps(tps60), formatQpsTps(tps300), formatQpsTps(tps600))
                         ).append(" ");
                     }

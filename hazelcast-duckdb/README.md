@@ -212,6 +212,17 @@ mvn -pl hazelcast-duckdb -am clean package -DskipTests
 mvn -pl hazelcast-duckdb -am exec:java \
   -Dexec.mainClass=com.hazelcast.samples.duckdb.HazelcastDuckDbApplication \
   -Dexec.args="1"
+  --add-opens=java.base/java.nio=ALL-UNNAMED 
+  -Dduckdb.batch.count=1000 
+  -Dduckdb.batch-writing.size=10000 
+  -Dduckdb.jet.parallelism=4 
+  -Dduckdb.source.realtime=true 
+  -Dduckdb.generation.qps=100000 
+  -Dduckdb.batch-writing.timeout-ms=600000 
+  -Dduckdb.stats.rolling.enabled=true 
+  -Dduckdb.stats.source.enabled=false 
+  -Dduckdb.write.mode=arrow 
+  -Dduckdb.mongo.external.enabled=true
 
 # 方式2: 打包后运行
 mvn -pl hazelcast-duckdb -am package
@@ -338,3 +349,15 @@ Join（宽表查询）: 行数=3500, QPS=4108.0
 | 连接管理 | 每次创建 | 连接复用 | ~2x |
 | WAL | 自动检查点 | 关闭 | ~1.5x |
 | 总提升 | - | - | **~5-10x** |
+
+## MongoDB 外部表配置说明
+
+| 属性名 | 默认值 | 说明 |
+|--------|--------|------|
+| `duckdb.mongo.external.enabled` | false | 启用 MongoDB 外部表模式（写入走 MongoDB API，查询走 DuckDB 外表） |
+| `duckdb.mongo.uri` | `mongodb://localhost:27017` | MongoDB 连接串 |
+| `duckdb.mongo.database` | `tapdata-develop` | MongoDB 数据库名 |
+| `duckdb.mongo.schema` | `mongo_db` | DuckDB 外表 schema 别名 |
+| `duckdb.mongo.collection.buyer` | `buyer_info` | 买家集合名 |
+| `duckdb.mongo.collection.order` | `order_main` | 订单集合名 |
+| `duckdb.mongo.collection.item` | `order_item` | 订单项集合名 |

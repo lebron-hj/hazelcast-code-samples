@@ -346,7 +346,10 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
                 }
             }
             long durationNanos = System.nanoTime() - startNanos;
-            StatsCollector.getInstance().recordBatch(1, rows.size(), durationNanos);
+            long entityCount = (batch.buyer() == null ? 0 : 1)
+                    + (batch.order() == null ? 0 : 1)
+                    + (batch.items() == null ? 0 : batch.items().size());
+            StatsCollector.getInstance().recordBatch(1, entityCount, durationNanos);
             return rows;
         }
     }
@@ -469,9 +472,13 @@ public class EcommerceDuckDbOperator implements DuckDbOperator, AutoCloseable {
         
         // 记录统计
         long durationNanos = System.nanoTime() - startNanos;
-        int totalRows = allResults.size();
-        StatsCollector.getInstance().recordBatch(batchesToProcess.size(), totalRows, durationNanos);
-        
+        long entityCount = batchesToProcess.stream()
+                .mapToLong(batch -> (batch.buyer() == null ? 0 : 1)
+                        + (batch.order() == null ? 0 : 1)
+                        + (batch.items() == null ? 0 : batch.items().size()))
+                .sum();
+        StatsCollector.getInstance().recordBatch(batchesToProcess.size(), entityCount, durationNanos);
+
         // 打印DuckDB性能统计（类似HighPerformanceDataGenerator的printStats）
         StatsCollector.getInstance().printStats();
         

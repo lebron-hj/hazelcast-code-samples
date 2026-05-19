@@ -179,6 +179,39 @@ public final class PerfConfig {
      */
     public static final String RESULT_LIST_NAME;
 
+    // ==================== MongoDB 外部表配置 ====================
+
+    /**
+     * 是否启用 MongoDB 外部表模式
+     * 可通过系统属性 duckdb.mongo.external.enabled 覆盖
+     */
+    public static final boolean MONGO_EXTERNAL_ENABLED;
+
+    /**
+     * MongoDB 连接串
+     * 可通过系统属性 duckdb.mongo.uri 覆盖
+     */
+    public static final String MONGO_URI;
+
+    /**
+     * MongoDB 数据库名
+     * 可通过系统属性 duckdb.mongo.database 覆盖
+     */
+    public static final String MONGO_DATABASE;
+
+    /**
+     * DuckDB Mongo 外部表 schema 别名
+     * 可通过系统属性 duckdb.mongo.schema 覆盖
+     */
+    public static final String MONGO_SCHEMA;
+
+    /**
+     * MongoDB 集合名映射
+     */
+    public static final String MONGO_BUYER_COLLECTION;
+    public static final String MONGO_ORDER_COLLECTION;
+    public static final String MONGO_ITEM_COLLECTION;
+
     // ==================== 初始化静态块 ====================
 
     static {
@@ -243,6 +276,15 @@ public final class PerfConfig {
         // 列表名称
         SOURCE_LIST_NAME = System.getProperty("duckdb.list.source-name", "ecommerce-source");
         RESULT_LIST_NAME = System.getProperty("duckdb.list.result-name", "ecommerce-output");
+
+        // MongoDB 外部表配置
+        MONGO_EXTERNAL_ENABLED = Boolean.parseBoolean(System.getProperty("duckdb.mongo.external.enabled", "false"));
+        MONGO_URI = System.getProperty("duckdb.mongo.uri", "mongodb://localhost:27017");
+        MONGO_DATABASE = System.getProperty("duckdb.mongo.database", "tapdata-develop");
+        MONGO_SCHEMA = System.getProperty("duckdb.mongo.schema", "mongo_db");
+        MONGO_BUYER_COLLECTION = System.getProperty("duckdb.mongo.collection.buyer", "buyer_info");
+        MONGO_ORDER_COLLECTION = System.getProperty("duckdb.mongo.collection.order", "order_main");
+        MONGO_ITEM_COLLECTION = System.getProperty("duckdb.mongo.collection.item", "order_item");
     }
 
     public static Connection openDuckDbConnection() throws SQLException {
@@ -287,6 +329,8 @@ public final class PerfConfig {
                 .append(", 超时: ").append(BATCH_WRITING_TIMEOUT_MS).append("ms)\n");
         sb.append("最大重试次数: ").append(MAX_TRANSACTION_RETRY).append("\n");
         sb.append("滚动统计: ").append(ROLLING_STATS_ENABLED).append("\n");
+        sb.append("Mongo外部表: ").append(MONGO_EXTERNAL_ENABLED).append(" (schema: ")
+                .append(MONGO_SCHEMA).append(", db: ").append(MONGO_DATABASE).append(")\n");
         sb.append("============================\n");
         return sb.toString();
     }
