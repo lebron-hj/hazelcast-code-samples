@@ -390,17 +390,17 @@ public final class StatsCollector {
     }
     
     public void printStats() {
-        long currentTotalRows = totalRows.get();
-        long endNanos = System.nanoTime();
-        long totalElapsedNanos = endNanos - startNanos;
+//        long currentTotalRows = totalRows.get();
+//        long endNanos = System.nanoTime();
+//        long totalElapsedNanos = endNanos - startNanos;
         
-        double totalSeconds = totalElapsedNanos / 1_000_000_000.0;
-        double avgQps = currentTotalRows > 0 ? currentTotalRows / totalSeconds : 0.0;
+//        double totalSeconds = totalElapsedNanos / 1_000_000_000.0;
+//        double avgQps = currentTotalRows > 0 ? currentTotalRows / totalSeconds : 0.0;
         
-        System.out.println("\n========== 完整统计报告 ==========");
-        System.out.printf("%-20s %,d\n", "总行数:", currentTotalRows);
-        System.out.printf("%-20s %.2f s\n", "总耗时:", totalSeconds);
-        System.out.printf("%-20s %s%n", "平均 QPS:", formatQpsTps(avgQps));
+//        System.out.println("\n========== 完整统计报告 ==========");
+//        System.out.printf("%-20s %,d\n", "总行数:", currentTotalRows);
+//        System.out.printf("%-20s %.2f s\n", "总耗时:", totalSeconds);
+//        System.out.printf("%-20s %s%n", "平均 QPS:", formatQpsTps(avgQps));
 
         // 如果启用了滚动统计，显示多时间窗口统计
         if (rollingEnabled && totalSamples > 0) {
@@ -419,8 +419,8 @@ public final class StatsCollector {
             double avgLatency300 = calculateAvgLatencyForWindow(WINDOW_5_MIN);
             double avgLatency600 = calculateAvgLatencyForWindow(WINDOW_10_MIN);
             
-            System.out.printf("  ├─ %-18s %.2f/%.2f/%.2f/%.2f ms\n", "窗口处理时间[30s/1m/5m/10m]:", avgLatency30, avgLatency60, avgLatency300, avgLatency600);
-            
+            System.out.printf("  ├─ %-18s %.2f/%.2f/%.2f/%.2f ms\n", "写入总耗时[30s/1m/5m/10m]:", avgLatency30, avgLatency60, avgLatency300, avgLatency600);
+
             if (hasLatestJoin) {
                 System.out.printf("  ├─ %-18s %,d 行, %.3f ms\n", "最后 JOIN 查询:", latestJoinRows, latestJoinNanos / 1_000_000.0);
             }
@@ -430,7 +430,17 @@ public final class StatsCollector {
                 Map<String, Double> tps60 = calculateTableTpsForWindow(WINDOW_1_MIN);
                 Map<String, Double> tps300 = calculateTableTpsForWindow(WINDOW_5_MIN);
                 Map<String, Double> tps600 = calculateTableTpsForWindow(WINDOW_10_MIN);
-                
+                boolean tableWindowHasWrites = false;
+                for (String table : new String[]{"buyer_info", "order_main", "order_item"}) {
+                    if (tps30.getOrDefault(table, 0.0) > 0.0
+                            || tps60.getOrDefault(table, 0.0) > 0.0
+                            || tps300.getOrDefault(table, 0.0) > 0.0
+                            || tps600.getOrDefault(table, 0.0) > 0.0) {
+                        tableWindowHasWrites = true;
+                        break;
+                    }
+                }
+
                 System.out.println("\n【按表写入时间窗口统计】");
                 for (String table : new String[]{"buyer_info", "order_main", "order_item"}) {
                     double t30 = tps30.getOrDefault(table, 0.0);
@@ -439,6 +449,12 @@ public final class StatsCollector {
                     double t600 = tps600.getOrDefault(table, 0.0);
                     System.out.printf("  ├─ %s TPS[30s/1m/5m/10m]: %s/%s/%s/%s%n",
                             table, formatQpsTps(t30), formatQpsTps(t60), formatQpsTps(t300), formatQpsTps(t600));
+                }
+                if (!tableWindowHasWrites) {
+                    System.out.println("  └─ 注: 窗口内无写入时，TPS显示为0属于正常");
+                    if (avgLatency30 > 0.0 || avgLatency60 > 0.0 || avgLatency300 > 0.0 || avgLatency600 > 0.0) {
+                        System.out.println("     写入总耗时仍可能有值（包含无写入批次/只含删除的批次）");
+                    }
                 }
             }
         } else {
@@ -469,7 +485,7 @@ public final class StatsCollector {
             long itemNanos = tableNanos.getOrDefault("order_item", new AtomicLong()).get();
             double itemTps = itemNanos > 0 ? itemRows / (itemNanos / 1_000_000_000.0) : 0.0;
 
-            System.out.printf("%n[DUCKDB] QPS: %s | 总批次: %,d | 总行数: %,d | 平均延迟: %.2fms | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %s | 表写入: buyer=%d(%sTPS) order=%d(%sTPS) item=%d(%sTPS)%n",
+            System.out.printf("%n[DUCKDB] QPS: %s | 总批次: %,d | 订单总行数【去重】: %,d | 平均延迟: %.2fms | joinSeconds: %.2fms | joinRowCount: %,d | JOIN-QPS: %s | 表写入: buyer=%d(%sTPS) order=%d(%sTPS) item=%d(%sTPS)%n",
                     formatQpsTps(qps), batches, rows, avgLatencyMs, joinSeconds, joinRowCount, formatQpsTps(joinQps),
                     buyerRows, formatQpsTps(buyerTps), orderRows, formatQpsTps(orderTps), itemRows, formatQpsTps(itemTps));
         }
@@ -582,15 +598,26 @@ public final class StatsCollector {
                 // 各表 TPS（显示4个时间窗口，自适应单位）
                 if (tableStatsDetailed) {
                     sb.append("| ");
+                    boolean tableWindowHasWrites = false;
                     for (String table : new String[]{"buyer_info", "order_main", "order_item"}) {
                         double tps30 = tableTps30Sec.getOrDefault(table, 0.0);
                         double tps60 = tableTps1Min.getOrDefault(table, 0.0);
                         double tps300 = tableTps5Min.getOrDefault(table, 0.0);
                         double tps600 = tableTps10Min.getOrDefault(table, 0.0);
+                        if (tps30 > 0.0 || tps60 > 0.0 || tps300 > 0.0 || tps600 > 0.0) {
+                            tableWindowHasWrites = true;
+                        }
                         sb.append(table).append("[30s/1m/5m/10m]:").append(
                                 String.format("%s/%s/%s/%s",
                                         formatQpsTps(tps30), formatQpsTps(tps60), formatQpsTps(tps300), formatQpsTps(tps600))
                         ).append(" ");
+                    }
+                    if (!tableWindowHasWrites) {
+                        sb.append("(窗口无写入) ");
+                        if (avgLatency30Sec > 0.0 || avgLatency1Min > 0.0 || avgLatency5Min > 0.0
+                                || avgLatency10Min > 0.0) {
+                            sb.append("(写入总耗时包含无写入/仅删除批次) ");
+                        }
                     }
                 }
                 
@@ -603,7 +630,7 @@ public final class StatsCollector {
                 }
                 
                 // 窗口内平均延迟（显示4个时间窗口）
-                sb.append(String.format("| 窗口处理时间[30s/1m/5m/10m]: %.2f/%.2f/%.2f/%.2fms", 
+                sb.append(String.format("| 写入总耗时[30s/1m/5m/10m]: %.2f/%.2f/%.2f/%.2fms",
                         avgLatency30Sec, avgLatency1Min, avgLatency5Min, avgLatency10Min));
                 
                 System.out.print(sb);
@@ -614,7 +641,7 @@ public final class StatsCollector {
             lastTotalRows = currentTotalRows;
             lastSumBatchNanos = currentSumBatchNanos;
             lastCountBatchNanos = currentCountBatchNanos;
-            
+
             if (tableStatsDetailed) {
                 tableDeltaMap.forEach((table, delta) -> {
                     AtomicLong lastVal = lastTableRows.get(table);
@@ -639,35 +666,29 @@ public final class StatsCollector {
         }
         
         int actualSamples = Math.min(windowSize, totalSamples);
+        
+        // 如果实际样本数量小于窗口大小，说明运行时间还比较短
+        // 这时候直接使用与平均 QPS 相同的计算方式，避免差异
+        if (actualSamples < windowSize && totalSamples > 0) {
+            long currentTotalRows = totalRows.get();
+            long endNanos = System.nanoTime();
+            long totalElapsedNanos = endNanos - startNanos;
+            double totalSeconds = totalElapsedNanos / 1_000_000_000.0;
+            return currentTotalRows > 0 ? currentTotalRows / totalSeconds : 0.0;
+        }
+        
         long totalRowsInWindow = 0;
-        long firstTimestamp = 0;
-        long lastTimestamp = 0;
         
         // 从循环缓冲区中读取最近 N 个样本
         for (int i = 0; i < actualSamples; i++) {
             int idx = (sampleIndex - 1 - i + MAX_SAMPLES) % MAX_SAMPLES;
             if (sampleTimestamps[idx] > 0) {
                 totalRowsInWindow += deltaTotalRows[idx];
-                if (i == 0) {
-                    lastTimestamp = sampleTimestamps[idx];
-                }
-                if (i == actualSamples - 1) {
-                    firstTimestamp = sampleTimestamps[idx];
-                }
             }
         }
         
-        // 使用实际时间差计算窗口时间，提高精度
-        double windowSeconds;
-        if (lastTimestamp > firstTimestamp && firstTimestamp > 0) {
-            windowSeconds = (lastTimestamp - firstTimestamp) / 1000.0;
-            // 防止时间差太小，使用实际采样数量作为下限
-            if (windowSeconds < 0.1) {
-                windowSeconds = actualSamples;
-            }
-        } else {
-            windowSeconds = actualSamples;
-        }
+        // 使用统一的窗口时间计算方法
+        double windowSeconds = calculateWindowSeconds(actualSamples);
         
         return windowSeconds > 0 ? totalRowsInWindow / windowSeconds : 0.0;
     }
@@ -683,6 +704,24 @@ public final class StatsCollector {
         }
         
         int actualSamples = Math.min(windowSize, totalSamples);
+        
+        // 如果实际样本数量小于窗口大小，说明运行时间还比较短
+        // 这时候计算各表的总 TPS，与总体 QPS 保持一致的计算方式
+        if (actualSamples < windowSize && totalSamples > 0) {
+            long endNanos = System.nanoTime();
+            long totalElapsedNanos = endNanos - startNanos;
+            double totalSeconds = totalElapsedNanos / 1_000_000_000.0;
+            
+            for (String table : new String[]{"buyer_info", "order_main", "order_item"}) {
+                AtomicLong tableRowCount = tableRows.get(table);
+                if (tableRowCount != null) {
+                    long rows = tableRowCount.get();
+                    double tps = totalSeconds > 0 ? rows / totalSeconds : 0.0;
+                    result.put(table, tps);
+                }
+            }
+            return result;
+        }
         
         // 首先计算窗口时间
         double windowSeconds = calculateWindowSeconds(actualSamples);
@@ -713,7 +752,7 @@ public final class StatsCollector {
      */
     private double calculateWindowSeconds(int actualSamples) {
         if (actualSamples <= 0 || totalSamples == 0) {
-            return actualSamples;
+            return Math.max(actualSamples, 1.0);
         }
         
         long firstTimestamp = 0;
@@ -734,14 +773,24 @@ public final class StatsCollector {
         double windowSeconds;
         if (lastTimestamp > firstTimestamp && firstTimestamp > 0) {
             windowSeconds = (lastTimestamp - firstTimestamp) / 1000.0;
-            if (windowSeconds < 0.1) {
+            // 只有当时间差特别小的时候才做限制
+            if (windowSeconds < 0.001) {
                 windowSeconds = actualSamples;
+            }
+        } else if (actualSamples == 1) {
+            // 只有一个样本时，使用从开始到现在的时间
+            long now = System.currentTimeMillis();
+            long firstSampleTs = sampleTimestamps[(sampleIndex - 1 + MAX_SAMPLES) % MAX_SAMPLES];
+            windowSeconds = (now - firstSampleTs) / 1000.0;
+            if (windowSeconds <= 0) {
+                windowSeconds = 0.1;
             }
         } else {
             windowSeconds = actualSamples;
         }
         
-        return windowSeconds;
+        // 窗口时间最小为 0.1 秒，避免分母太小导致 QPS 异常大
+        return Math.max(windowSeconds, 0.1);
     }
     
     /**

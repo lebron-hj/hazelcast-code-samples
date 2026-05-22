@@ -45,6 +45,7 @@ import java.util.concurrent.locks.LockSupport;
  * 4. 高效随机数生成 - 使用XorShift随机数生成器
  * 5. 批量发射 - 一次发射多个batch提高吞吐
  * 6. 无锁设计 - 使用CAS操作减少锁竞争
+ * 7. 可配置重复率 - 支持设置数据重复率，用于测试更新场景
  */
 public final class HighPerformanceDataGenerator {
 
@@ -71,10 +72,20 @@ public final class HighPerformanceDataGenerator {
     private final int workerCount;
     private final long nanosPerBatch;
     
+    // 数据重复率（百分比，0-100），默认0%
+    private final int duplicateRate;
+    
+    // 全局ID生成器（保证自增唯一性）
+    private static final AtomicLong globalBuyerIdGen = new AtomicLong(10000L);
+    private static final AtomicLong globalOrderIdGen = new AtomicLong(1_000_000L);
+    private static final AtomicLong globalItemIdGen = new AtomicLong(10_000_000L);
+    
+    // 已生成的ID缓存（用于生成重复数据）
+    private static final java.util.concurrent.ConcurrentLinkedQueue<Long> generatedBuyerIds = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final java.util.concurrent.ConcurrentLinkedQueue<Long> generatedOrderIds = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final java.util.concurrent.ConcurrentLinkedQueue<Long> generatedItemIds = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    
     // 线程本地ID生成器（避免竞争）
-    private final ThreadLocal<AtomicLong> buyerIdGen = ThreadLocal.withInitial(() -> new AtomicLong(10000L));
-    private final ThreadLocal<AtomicLong> orderIdGen = ThreadLocal.withInitial(() -> new AtomicLong(1_000_000L));
-    private final ThreadLocal<AtomicLong> itemIdGen = ThreadLocal.withInitial(() -> new AtomicLong(10_000_000L));
     private final ThreadLocal<AtomicLong> batchIdGen = ThreadLocal.withInitial(() -> new AtomicLong(0L));
     
     // 高效随机数生成器
@@ -82,6 +93,7 @@ public final class HighPerformanceDataGenerator {
     
     // 统计
     private final AtomicLong totalBatches = new AtomicLong(0);
+    private final AtomicLong duplicateBatches = new AtomicLong(0);
     private volatile long lastPrintTime = System.currentTimeMillis();
     private volatile long lastBatchCount = 0;
     
@@ -91,7 +103,12 @@ public final class HighPerformanceDataGenerator {
     private volatile boolean running = true;
 
     private HighPerformanceDataGenerator(int targetQps) {
+        this(targetQps, 0);
+    }
+
+    private HighPerformanceDataGenerator(int targetQps, int duplicateRate) {
         this.targetQps = targetQps;
+        this.duplicateRate = Math.min(100, Math.max(0, duplicateRate));
         this.nanosPerBatch = targetQps > 0 ? 1_000_000_000L / targetQps : 0;
         // 根据目标QPS计算worker数量
         this.workerCount = Math.min(32, Math.max(4, targetQps / 10000));
@@ -104,21 +121,33 @@ public final class HighPerformanceDataGenerator {
      * @return StreamSource
      */
     public static StreamSource<EcommerceOrderBatch> createSource(int targetQps) {
-        return Sources.streamFromProcessor("high-performance-source",
-                ProcessorMetaSupplier.preferLocalParallelismOne(
-                        (SupplierEx<Processor>) () -> new DataGeneratorProcessor(targetQps)));
+        return createSource(targetQps, 0);
     }
 
     /**
-     * 创建高性能数据生成source（带并行度）
+     * 创建高性能数据生成source（带重复率）
      *
-     * @param targetQps   目标QPS
-     * @param parallelism 并行度
+     * @param targetQps      目标QPS（每秒生成的批次数），0表示无限制
+     * @param duplicateRate  数据重复率（0-100，百分比），默认0%
      * @return StreamSource
      */
-    public static StreamSource<EcommerceOrderBatch> createSource(int targetQps, int parallelism) {
+    public static StreamSource<EcommerceOrderBatch> createSource(int targetQps, int duplicateRate) {
         return Sources.streamFromProcessor("high-performance-source",
-                ProcessorMetaSupplier.of(parallelism, () -> new DataGeneratorProcessor(targetQps)));
+                ProcessorMetaSupplier.preferLocalParallelismOne(
+                        (SupplierEx<Processor>) () -> new DataGeneratorProcessor(targetQps, duplicateRate)));
+    }
+
+    /**
+     * 创建高性能数据生成source（带并行度和重复率）
+     *
+     * @param targetQps      目标QPS
+     * @param parallelism    并行度
+     * @param duplicateRate  数据重复率（0-100，百分比）
+     * @return StreamSource
+     */
+    public static StreamSource<EcommerceOrderBatch> createSource(int targetQps, int parallelism, int duplicateRate) {
+        return Sources.streamFromProcessor("high-performance-source",
+                ProcessorMetaSupplier.of(parallelism, () -> new DataGeneratorProcessor(targetQps, duplicateRate)));
     }
 
     /**
@@ -179,26 +208,108 @@ public final class HighPerformanceDataGenerator {
     }
 
     /**
+     * 获取买家ID（支持重复率）
+     */
+    private long getBuyerId(XorShiftRandom rnd) {
+        if (duplicateRate > 0 && !generatedBuyerIds.isEmpty() && rnd.nextInt(100) < duplicateRate) {
+            // 生成重复数据
+            Long cachedId = generatedBuyerIds.peek();
+            if (cachedId != null && rnd.nextBoolean()) {
+                return cachedId;
+            }
+            // 随机从缓存中获取一个ID
+            int idx = rnd.nextInt(generatedBuyerIds.size() + 1);
+            for (Long id : generatedBuyerIds) {
+                if (idx-- <= 0) {
+                    return id;
+                }
+            }
+        }
+        // 生成新ID
+        long newId = globalBuyerIdGen.incrementAndGet();
+        generatedBuyerIds.offer(newId);
+        // 限制缓存大小
+        if (generatedBuyerIds.size() > 10000) {
+            generatedBuyerIds.poll();
+        }
+        return newId;
+    }
+
+    /**
+     * 获取订单ID（支持重复率）
+     */
+    private long getOrderId(XorShiftRandom rnd) {
+        if (duplicateRate > 0 && !generatedOrderIds.isEmpty() && rnd.nextInt(100) < duplicateRate) {
+            Long cachedId = generatedOrderIds.peek();
+            if (cachedId != null && rnd.nextBoolean()) {
+                return cachedId;
+            }
+            int idx = rnd.nextInt(generatedOrderIds.size() + 1);
+            for (Long id : generatedOrderIds) {
+                if (idx-- <= 0) {
+                    return id;
+                }
+            }
+        }
+        long newId = globalOrderIdGen.incrementAndGet();
+        generatedOrderIds.offer(newId);
+        if (generatedOrderIds.size() > 10000) {
+            generatedOrderIds.poll();
+        }
+        return newId;
+    }
+
+    /**
+     * 获取订单项ID（支持重复率）
+     */
+    private long getItemId(XorShiftRandom rnd) {
+        if (duplicateRate > 0 && !generatedItemIds.isEmpty() && rnd.nextInt(100) < duplicateRate) {
+            Long cachedId = generatedItemIds.peek();
+            if (cachedId != null && rnd.nextBoolean()) {
+                return cachedId;
+            }
+            int idx = rnd.nextInt(generatedItemIds.size() + 1);
+            for (Long id : generatedItemIds) {
+                if (idx-- <= 0) {
+                    return id;
+                }
+            }
+        }
+        long newId = globalItemIdGen.incrementAndGet();
+        generatedItemIds.offer(newId);
+        if (generatedItemIds.size() > 50000) {
+            generatedItemIds.poll();
+        }
+        return newId;
+    }
+
+    /**
      * 生成订单批次（高度优化版本）
      */
     private EcommerceOrderBatch generateOrderBatch() {
         XorShiftRandom rnd = random.get();
         
-        // 生成买家
-        long buyerId = buyerIdGen.get().incrementAndGet();
+        // 判断是否生成重复批次
+        boolean isDuplicate = duplicateRate > 0 && rnd.nextInt(100) < duplicateRate;
+        if (isDuplicate) {
+            duplicateBatches.incrementAndGet();
+        }
+        
+        // 生成买家（使用全局自增ID）
+        long buyerId = getBuyerId(rnd);
         EcommerceBuyer buyer = new EcommerceBuyer(
                 buyerId,
-                "buyer-" + rnd.nextInt(1_000_000),
+                "buyer-" + (buyerId % 1_000_000),
                 "买家" + buyerId,
-                "1" + (100_000_000 + rnd.nextInt(900_000_000)),
-                BUYER_LEVEL_LIST[rnd.nextInt(BUYER_LEVEL_LIST.length)],
-                AREA_LIST[rnd.nextInt(AREA_LIST.length)],
+                "1" + (100_000_000 + (buyerId % 900_000_000)),
+                BUYER_LEVEL_LIST[(int)(buyerId % BUYER_LEVEL_LIST.length)],
+                AREA_LIST[(int)(buyerId % AREA_LIST.length)],
                 System.currentTimeMillis() - rnd.nextLong(31_536_000_000L)
         );
 
-        // 生成订单
+        // 生成订单（使用全局自增ID）
         long now = System.currentTimeMillis();
-        long orderId = orderIdGen.get().incrementAndGet();
+        long orderId = getOrderId(rnd);
         double freightAmount = rnd.nextInt(50);
         double couponAmount = rnd.nextBoolean() ? 0.0 : rnd.nextDouble() * 20;
         double totalAmount = 50.0 + rnd.nextDouble() * 1000.0;
@@ -206,40 +317,40 @@ public final class HighPerformanceDataGenerator {
         
         EcommerceOrder order = new EcommerceOrder(
                 orderId,
-                "ORD" + now + rnd.nextInt(1000),
+                "ORD" + String.format("%019d", orderId),
                 buyerId,
                 now,
                 now + rnd.nextInt(3_600_000),
-                ORDER_STATUS_LIST[rnd.nextInt(ORDER_STATUS_LIST.length)],
-                PAY_WAY_LIST[rnd.nextInt(PAY_WAY_LIST.length)],
-                ORDER_CHANNEL_LIST[rnd.nextInt(ORDER_CHANNEL_LIST.length)],
+                ORDER_STATUS_LIST[(int)(orderId % ORDER_STATUS_LIST.length)],
+                PAY_WAY_LIST[(int)(orderId % PAY_WAY_LIST.length)],
+                ORDER_CHANNEL_LIST[(int)(orderId % ORDER_CHANNEL_LIST.length)],
                 totalAmount,
                 payAmount,
                 freightAmount,
                 couponAmount,
                 buyer.buyerRealName() + "收",
-                "1" + (100_000_000 + rnd.nextInt(900_000_000)),
-                AREA_LIST[rnd.nextInt(AREA_LIST.length)] + " " + (rnd.nextInt(100) + 1) + "号"
+                "1" + (100_000_000 + (orderId % 900_000_000)),
+                AREA_LIST[(int)(orderId % AREA_LIST.length)] + " " + ((int)(orderId % 100) + 1) + "号"
         );
 
-        // 生成订单项（预分配列表）
+        // 生成订单项（预分配列表，使用全局自增ID）
         int itemCount = 2 + rnd.nextInt(4);
         List<EcommerceOrderItem> items = new ArrayList<>(itemCount);
         for (int i = 0; i < itemCount; i++) {
-            int catIdx = rnd.nextInt(CATEGORY1_LIST.length);
+            int catIdx = (int)((orderId + i) % CATEGORY1_LIST.length);
             double salePrice = rnd.nextDouble() * 800;
             int buyNum = 1 + rnd.nextInt(5);
             double itemSubtotal = salePrice * buyNum;
             
             items.add(new EcommerceOrderItem(
-                    itemIdGen.get().incrementAndGet(),
+                    getItemId(rnd),
                     orderId,
-                    "SPU" + (100_000 + rnd.nextInt(900_000)),
-                    "SKU" + (100_000_000 + rnd.nextInt(900_000_000)),
+                    "SPU" + String.format("%06d", (int)(orderId % 900_000) + 100_000),
+                    "SKU" + String.format("%09d", (int)(orderId % 900_000_000) + 100_000_000),
                     CATEGORY1_LIST[catIdx] + "商品",
                     CATEGORY1_LIST[catIdx],
                     CATEGORY2_MAP[catIdx],
-                    BRAND_LIST[rnd.nextInt(BRAND_LIST.length)],
+                    BRAND_LIST[(int)((orderId + i) % BRAND_LIST.length)],
                     rnd.nextDouble() * 1000,
                     salePrice,
                     buyNum,
@@ -271,9 +382,11 @@ public final class HighPerformanceDataGenerator {
         if (elapsed >= 1000) {
             long batchesInSecond = total - lastBatchCount;
             double qps = batchesInSecond * 1000.0 / elapsed;
+            long dupCount = duplicateBatches.get();
+            double dupRate = total > 0 ? (dupCount * 100.0 / total) : 0;
             
-            System.out.printf("[SOURCE] QPS: %.1f | 累计批次: %,d | 目标QPS: %d | Worker数: %d%n", 
-                    qps, total, targetQps, workerCount);
+            System.out.printf("[SOURCE] QPS: %.1f | 累计批次: %,d | 重复批次: %,d (%.1f%%) | 目标QPS: %d | 重复率配置: %d%% | Worker数: %d%n", 
+                    qps, total, dupCount, dupRate, targetQps, duplicateRate, workerCount);
             
             lastPrintTime = now;
             lastBatchCount = total;
@@ -343,7 +456,11 @@ public final class HighPerformanceDataGenerator {
         private final Deque<EcommerceOrderBatch> pendingBatches = new ArrayDeque<>();
 
         DataGeneratorProcessor(int targetQps) {
-            this.generator = new HighPerformanceDataGenerator(targetQps);
+            this(targetQps, 0);
+        }
+
+        DataGeneratorProcessor(int targetQps, int duplicateRate) {
+            this.generator = new HighPerformanceDataGenerator(targetQps, duplicateRate);
         }
 
         @Override

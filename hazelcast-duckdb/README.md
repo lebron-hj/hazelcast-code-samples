@@ -85,44 +85,11 @@ src/main/java/com/hazelcast/samples/duckdb/
 ### 运行时流程
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     HazelcastDuckDbApplication.main()                   │
-│                          创建 Hazelcast 实例                              │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│              EcommerceMockGenerator.generateBatches()                   │
-│              生成 N 个 EcommerceOrderBatch（默认 1000）                    │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   HazelcastDuckDbJob.run()                              │
-│  ┌─────────────┐    ┌─────────────────┐    ┌─────────────────────┐     │
-│  │ StreamSource│───▶│ mapUsingService │───▶│   Sinks.list()      │     │
-│  │ (批次流)    │    │ (DuckDB写入)    │    │ (宽表结果输出)      │     │
-│  └─────────────┘    └─────────────────┘    └─────────────────────┘     │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│              EcommerceDuckDbOperator.processBatch()                     │
-│  ┌─────────────────────────────────────────────────────┐                │
-│  │ 1. 删除指定订单 (如存在)                              │                │
-│  │ 2. Upsert buyer_info                                │                │
-│  │ 3. Upsert order_main                                │                │
-│  │ 4. Batch upsert order_item                          │                │
-│  │ 5. 执行宽表 JOIN 查询                               │                │
-│  │ 6. 提交事务                                         │                │
-│  └─────────────────────────────────────────────────────┘                │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        StatsCollector.printSummary()                    │
-│              输出吞吐/延迟统计，包括 QPS、平均延迟、按表统计               │
-└─────────────────────────────────────────────────────────────────────────┘
+1) HazelcastDuckDbApplication.main() starts a Hazelcast instance.
+2) EcommerceMockGenerator.generateBatches() creates EcommerceOrderBatch data.
+3) HazelcastDuckDbJob.run() builds the pipeline and writes results to a list sink.
+4) EcommerceDuckDbOperator.processBatch() writes data and runs the join query.
+5) StatsCollector.printSummary() outputs throughput and latency metrics.
 ```
 
 ### 关键代码片段
@@ -221,6 +188,7 @@ mvn -pl hazelcast-duckdb -am exec:java \
   -Dduckdb.batch-writing.timeout-ms=600000 
   -Dduckdb.stats.rolling.enabled=true 
   -Dduckdb.stats.source.enabled=false 
+  -Dduckdb.stats.table-detailed=false
   -Dduckdb.write.mode=arrow 
   -Dduckdb.mongo.external.enabled=true
 
@@ -361,3 +329,26 @@ Join（宽表查询）: 行数=3500, QPS=4108.0
 | `duckdb.mongo.collection.buyer` | `buyer_info` | 买家集合名 |
 | `duckdb.mongo.collection.order` | `order_main` | 订单集合名 |
 | `duckdb.mongo.collection.item` | `order_item` | 订单项集合名 |
+
+## Arrow + MongoDB 外部表 JOIN 性能优化
+
+### 1. MongoDB 索引（已在代码中自动创建）
+
+当开启 `duckdb.mongo.external.enabled=true` 时，`ArrowModeDuckDbOperator` 会在启动时创建以下索引以加速 JOIN 和 upsert：
+
+- `buyer_info`: `buyer_id`（唯一索引）
+- `order_main`: `order_id`（唯一索引）、`buyer_id`（普通索引）
+- `order_item`: `item_id`（唯一索引）、`order_id`（普通索引）
+
+> 如需自定义索引策略，可在 `ArrowModeDuckDbOperator.ensureMongoIndexes()` 中调整。
+
+### 2. 其他优化手段（按影响排序）
+
+- 控制 JOIN 驱动表：优先让 `order_main` 作为驱动表，并缩小 `IN (...)` 的批量大小，避免外部表全表扫描。
+- 降低列宽：JOIN 查询只选择必要字段，减少 Arrow/网络传输的列宽和解码成本。
+- 分批查询：将 `order_id IN (...)` 拆分为多个小批次，降低单次 JOIN 的峰值内存与 Mongo 扫描时延。
+- 参数化查询：将 `IN` 列表改为 `VALUES` 临时表或参数化绑定，减少 SQL 解析与字符串拼接开销。
+- 调整 DuckDB 线程与内存：增大 `threads` 与 `memory_limit`，同时避免过高并发导致 Mongo 端压力。
+- 减少写后立即读：必要时对 JOIN 查询引入微小延迟或队列，减少写入后查询导致的热点。
+- 优化 MongoDB 连接池：提升 `maxPoolSize`，并尽量保持连接复用，避免频繁建立连接。
+- 预估行数并限流：在高并发下控制 `order_id` 输入数量，避免一次性 JOIN 太大。

@@ -42,6 +42,8 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.WriteModel;
@@ -129,6 +131,21 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                     PerfConfig.MONGO_SCHEMA);
             stmt.execute(attachSql);
         }
+        ensureMongoIndexes();
+    }
+
+    private void ensureMongoIndexes() {
+        MongoCollection<Document> buyerCollection = getMongoCollection(PerfConfig.MONGO_BUYER_COLLECTION);
+        MongoCollection<Document> orderCollection = getMongoCollection(PerfConfig.MONGO_ORDER_COLLECTION);
+        MongoCollection<Document> itemCollection = getMongoCollection(PerfConfig.MONGO_ITEM_COLLECTION);
+
+        IndexOptions unique = new IndexOptions().unique(true);
+
+        buyerCollection.createIndex(Indexes.ascending("buyer_id"), unique);
+        orderCollection.createIndex(Indexes.ascending("order_id"), unique);
+        orderCollection.createIndex(Indexes.ascending("buyer_id"));
+        itemCollection.createIndex(Indexes.ascending("item_id"), unique);
+        itemCollection.createIndex(Indexes.ascending("order_id"));
     }
 
     private void initTables() throws SQLException {
@@ -268,11 +285,12 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                 connection.commit();
                 
                 // 更新统计
-                long entityCount = batches.stream()
-                        .mapToLong(batch -> (batch.buyer() == null ? 0 : 1)
-                                + (batch.order() == null ? 0 : 1)
-                                + (batch.items() == null ? 0 : batch.items().size()))
-                        .sum();
+                long entityCount = orders.size();
+//                long entityCount = batches.stream()
+//                        .mapToLong(batch -> (batch.buyer() == null ? 0 : 1)
+//                                + (batch.order() == null ? 0 : 1)
+//                                + (batch.items() == null ? 0 : batch.items().size()))
+//                        .sum();
                 StatsCollector.getInstance().recordBatch(batches.size(), entityCount,
                         System.nanoTime() - startTime);
 
@@ -312,6 +330,8 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         if (buyers.isEmpty()) {
             return;
         }
+        long writeStart = System.nanoTime();
+        
         MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_BUYER_COLLECTION);
         List<WriteModel<Document>> writes = new ArrayList<>(buyers.size());
         ReplaceOptions options = new ReplaceOptions().upsert(true);
@@ -325,13 +345,41 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                     .append("register_time", buyer.registerTime());
             writes.add(new ReplaceOneModel<>(Filters.eq("buyer_id", buyer.buyerId()), doc, options));
         }
-        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+        
+        Exception lastException = null;
+        for (int attempt = 0; attempt <= PerfConfig.MAX_TRANSACTION_RETRY; attempt++) {
+            try {
+                collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+                lastException = null;
+                break;
+            } catch (Exception e) {
+                lastException = e;
+                StatsCollector.getInstance().recordTableRetry("buyer_info");
+                
+                if (attempt < PerfConfig.MAX_TRANSACTION_RETRY) {
+                    try {
+                        Thread.sleep(PerfConfig.RETRY_DELAY_BASE_MS * (attempt + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (lastException != null) {
+            throw new RuntimeException("Failed to write buyers to MongoDB", lastException);
+        }
+        
+        StatsCollector.getInstance().recordTableWrite("buyer_info", buyers.size(), System.nanoTime() - writeStart);
     }
 
     private void writeOrdersWithMongo(List<EcommerceOrder> orders) {
         if (orders.isEmpty()) {
             return;
         }
+        long writeStart = System.nanoTime();
+        
         MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_ORDER_COLLECTION);
         List<WriteModel<Document>> writes = new ArrayList<>(orders.size());
         ReplaceOptions options = new ReplaceOptions().upsert(true);
@@ -349,13 +397,42 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                     .append("pay_time", order.payTime());
             writes.add(new ReplaceOneModel<>(Filters.eq("order_id", order.orderId()), doc, options));
         }
-        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+        
+        Exception lastException = null;
+        for (int attempt = 0; attempt <= PerfConfig.MAX_TRANSACTION_RETRY; attempt++) {
+            try {
+                collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+                lastException = null;
+                break;
+            } catch (Exception e) {
+                lastException = e;
+                StatsCollector.getInstance().recordTableRetry("order_main");
+                
+                if (attempt < PerfConfig.MAX_TRANSACTION_RETRY) {
+                    try {
+                        Thread.sleep(PerfConfig.RETRY_DELAY_BASE_MS * (attempt + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (lastException != null) {
+            throw new RuntimeException("Failed to write orders to MongoDB", lastException);
+        }
+        
+        StatsCollector.getInstance().recordTableWrite("order_main", orders.size(), System.nanoTime() - writeStart);
     }
 
     private void writeOrderItemsWithMongo(List<EcommerceOrderItem> items) {
         if (items.isEmpty()) {
             return;
         }
+        long writeStart = System.nanoTime();
+        int retryCount = 0;
+        
         MongoCollection<Document> collection = getMongoCollection(PerfConfig.MONGO_ITEM_COLLECTION);
         List<WriteModel<Document>> writes = new ArrayList<>(items.size());
         ReplaceOptions options = new ReplaceOptions().upsert(true);
@@ -375,7 +452,34 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
                     .append("goods_spec", item.goodsSpec());
             writes.add(new ReplaceOneModel<>(Filters.eq("item_id", item.itemId()), doc, options));
         }
-        collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+        
+        Exception lastException = null;
+        for (int attempt = 0; attempt <= PerfConfig.MAX_TRANSACTION_RETRY; attempt++) {
+            try {
+                collection.bulkWrite(writes, new BulkWriteOptions().ordered(false));
+                lastException = null;
+                break;
+            } catch (Exception e) {
+                lastException = e;
+                retryCount++;
+                StatsCollector.getInstance().recordTableRetry("order_item");
+                
+                if (attempt < PerfConfig.MAX_TRANSACTION_RETRY) {
+                    try {
+                        Thread.sleep(PerfConfig.RETRY_DELAY_BASE_MS * (attempt + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (lastException != null) {
+            throw new RuntimeException("Failed to write order items to MongoDB after " + retryCount + " retries", lastException);
+        }
+        
+        StatsCollector.getInstance().recordTableWrite("order_item", items.size(), System.nanoTime() - writeStart);
     }
 
     private String tableRef(String logicalTable) {
@@ -1049,7 +1153,7 @@ public class ArrowModeDuckDbOperator implements DuckDbOperator {
         if (orderIds.isEmpty()) {
             return rows;
         }
-        
+
         StringBuilder sqlBuilder = new StringBuilder();
         String buyerInfo = tableRef("buyer_info");
         String orderMain = tableRef("order_main");
